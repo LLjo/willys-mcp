@@ -37,10 +37,10 @@ export async function fetchOrderDetails(
     if (useCache && sessionId) {
       const cachedOrder = orderCache.getCachedOrder(orderNumber);
       if (cachedOrder) {
-        console.log(`Cache hit for order ${orderNumber}`);
+        console.error(`Cache hit for order ${orderNumber}`);
         return cachedOrder;
       }
-      console.log(`Cache miss for order ${orderNumber}, fetching from API`);
+      console.error(`Cache miss for order ${orderNumber}, fetching from API`);
     }
 
     // Fetch from API
@@ -70,13 +70,13 @@ export async function fetchOrderDetails(
     // Cache the result if caching is enabled and sessionId provided
     if (useCache && sessionId) {
       orderCache.setCachedOrder(orderNumber, sessionId, data);
-      console.log(`Cached raw order data for ${orderNumber}`);
+      console.error(`Cached raw order data for ${orderNumber}`);
 
       // Also store in relational format for fast SQL searching
       try {
         const { willysDatabase } = await import("./database");
         willysDatabase.storeOrderRelational(data, sessionId);
-        console.log(`Stored order ${orderNumber} in relational format`);
+        console.error(`Stored order ${orderNumber} in relational format`);
       } catch (error) {
         console.error(
           `Error storing order ${orderNumber} in relational format:`,
@@ -128,7 +128,7 @@ export async function batchFetchOrderDetails(
     }
   }
 
-  console.log(
+  console.error(
     `Batch fetched ${results.size}/${orderNumbers.length} order details`,
   );
   return results;

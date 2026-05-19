@@ -19,7 +19,7 @@ class WillysDatabase {
 
   async ensureInitialized() {
     if (this.initialized) {
-      console.log("Database already initialized, skipping...");
+      console.error("Database already initialized, skipping...");
       return;
     }
 
@@ -41,26 +41,32 @@ class WillysDatabase {
         sqliteVec = await import("sqlite-vec");
       }
 
-      // Get current working directory
-      const cwdString = process.cwd();
-
-      // Use require('path') to avoid ESM import issues
       const path = require("node:path");
+      const fs = require("node:fs");
 
-      // Use path.resolve to ensure we get an absolute path string
-      const DB_PATH = path.resolve(cwdString, "willys-cache.db");
-
-      // Ensure DB_PATH is definitely a string (not a URL object)
+      // Persistent data dir is configurable via WILLYS_DATA_DIR. In the HA
+      // compose stack we mount the named volume `willys-mcp-data` at
+      // /app/data and set WILLYS_DATA_DIR=/app/data, so the DB survives
+      // `docker compose up --build --force-recreate`. Without this env, fall
+      // back to process.cwd() (the legacy path) so non-docker dev still works.
+      const dataDir = process.env.WILLYS_DATA_DIR || process.cwd();
+      try {
+        fs.mkdirSync(dataDir, { recursive: true });
+      } catch (_e) {
+        // Mountpoints already exist; ignore EEXIST.
+      }
+      const DB_PATH = path.resolve(dataDir, "willys-cache.db");
       const dbPathString = String(DB_PATH);
+      console.error(`Opening Willys cache DB at ${dbPathString}`);
       this.db = new Database(dbPathString);
-      console.log("Database created successfully");
+      console.error("Database created successfully");
 
       this.db.pragma("journal_mode = WAL"); // Better performance for concurrent access
       this.db.pragma("synchronous = NORMAL"); // Good balance of safety and performance
-      console.log("Database pragmas set");
+      console.error("Database pragmas set");
 
       // Load sqlite-vec extension for vector operations
-      console.log("Loading sqlite-vec extension...");
+      console.error("Loading sqlite-vec extension...");
       try {
         // Ensure we're passing the database instance correctly
         if (
@@ -68,7 +74,7 @@ class WillysDatabase {
           this.db &&
           typeof this.db.prepare === "function"
         ) {
-          console.log("sqlite-vec available methods:", Object.keys(sqliteVec));
+          console.error("sqlite-vec available methods:", Object.keys(sqliteVec));
 
           // Use multiple approaches to load sqlite-vec extension
           let extensionLoaded = false;
@@ -77,19 +83,19 @@ class WillysDatabase {
           if (typeof sqliteVec.getLoadablePath === "function") {
             try {
               const extensionPath = sqliteVec.getLoadablePath();
-              console.log(
+              console.error(
                 "Loading sqlite-vec from getLoadablePath:",
                 extensionPath,
               );
-              console.log(
+              console.error(
                 "File exists check:",
                 require("node:fs").existsSync(extensionPath),
               );
               this.db.loadExtension(extensionPath);
               extensionLoaded = true;
-              console.log("sqlite-vec loaded successfully via getLoadablePath");
+              console.error("sqlite-vec loaded successfully via getLoadablePath");
             } catch (pathError) {
-              console.log(
+              console.error(
                 "getLoadablePath approach failed:",
                 pathError instanceof Error
                   ? pathError.message
@@ -101,7 +107,7 @@ class WillysDatabase {
           // Approach 2: Manual path construction for Next.js compatibility
           if (!extensionLoaded) {
             try {
-              console.log("Trying manual path construction...");
+              console.error("Trying manual path construction...");
               const path = require("node:path");
               const fs = require("node:fs");
 
@@ -113,15 +119,15 @@ class WillysDatabase {
                 "sqlite-vec-darwin-arm64",
                 "vec0.dylib",
               );
-              console.log("Manual extension path:", manualPath);
-              console.log("Manual path exists:", fs.existsSync(manualPath));
+              console.error("Manual extension path:", manualPath);
+              console.error("Manual path exists:", fs.existsSync(manualPath));
 
               if (fs.existsSync(manualPath)) {
                 this.db.loadExtension(manualPath);
                 extensionLoaded = true;
-                console.log("sqlite-vec loaded successfully via manual path");
+                console.error("sqlite-vec loaded successfully via manual path");
               } else {
-                console.log(
+                console.error(
                   "Manual path does not exist, trying generic sqlite-vec path...",
                 );
                 const genericPath = path.join(
@@ -133,13 +139,13 @@ class WillysDatabase {
                 if (fs.existsSync(genericPath)) {
                   this.db.loadExtension(genericPath);
                   extensionLoaded = true;
-                  console.log(
+                  console.error(
                     "sqlite-vec loaded successfully via generic path",
                   );
                 }
               }
             } catch (manualError) {
-              console.log(
+              console.error(
                 "Manual path approach failed:",
                 manualError instanceof Error
                   ? manualError.message
@@ -151,12 +157,12 @@ class WillysDatabase {
           // Approach 3: Direct load method as last resort
           if (!extensionLoaded) {
             try {
-              console.log("Trying direct sqliteVec.load method...");
+              console.error("Trying direct sqliteVec.load method...");
               sqliteVec.load(this.db);
               extensionLoaded = true;
-              console.log("sqlite-vec loaded successfully via direct load");
+              console.error("sqlite-vec loaded successfully via direct load");
             } catch (directError) {
-              console.log(
+              console.error(
                 "Direct load approach failed:",
                 directError instanceof Error
                   ? directError.message
@@ -167,10 +173,10 @@ class WillysDatabase {
 
           if (extensionLoaded) {
             this.vectorSupport = true;
-            console.log("✅ sqlite-vec extension loaded successfully");
+            console.error("✅ sqlite-vec extension loaded successfully");
           } else {
             this.vectorSupport = false;
-            console.log(
+            console.error(
               "❌ Failed to load sqlite-vec extension with all approaches",
             );
           }
@@ -198,7 +204,7 @@ class WillysDatabase {
       await this.initializeSchema();
       this.startCleanupTimer();
       this.initialized = true;
-      console.log("Database initialization completed");
+      console.error("Database initialization completed");
     } catch (error) {
       console.error("Failed to initialize database:", error);
       const err = error as NodeJS.ErrnoException;
@@ -257,13 +263,13 @@ class WillysDatabase {
       CREATE INDEX IF NOT EXISTS idx_order_cache_session ON order_cache(session_id);
     `);
 
-    console.log("Database schema initialized successfully");
+    console.error("Database schema initialized successfully");
 
     // Run migration if needed
     if (this.needsMigration()) {
-      console.log("Detected existing cache data, running migration...");
+      console.error("Detected existing cache data, running migration...");
       const result = this.migrateExistingCacheToRelational();
-      console.log(
+      console.error(
         `Migration completed: ${result.migrated} orders, ${result.errors} errors`,
       );
     }
@@ -278,10 +284,10 @@ class WillysDatabase {
           "SELECT COUNT(*) as count FROM products WHERE name_embedding IS NOT NULL",
         )
         .get() as any;
-      console.log(
+      console.error(
         `Vector embeddings available for ${embeddedProducts.count}/${totalProducts.count} products`,
       );
-      console.log(
+      console.error(
         "💡 Run generateMissingEmbeddings() to enable full semantic search capabilities",
       );
     }
@@ -313,8 +319,49 @@ class WillysDatabase {
         name_normalized TEXT,
         name_embedding BLOB,
         embedding_generated_at INTEGER,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        stale_at INTEGER,
+        preferred_at INTEGER,
+        category TEXT
       );
+    `);
+
+    // cart_history: append-only log of successful add_to_cart calls. Used by
+    // mcp__willys_preferred_add_last_cart_item — the Willys cart API itself
+    // exposes no per-item timestamp, so we record our own. One row per
+    // successful add (including substituted codes from the stale-retry path).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cart_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_code TEXT NOT NULL,
+        name TEXT,
+        added_at INTEGER NOT NULL
+      );
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cart_history_added_at
+        ON cart_history(added_at DESC);
+    `);
+
+    // product_aliases: many-to-one map from a short keyword to a product
+    // code. Drives the "add milk" / "add coffee" voice flow — a user-language
+    // alias resolves deterministically to the exact product the user means,
+    // sidestepping cross-lingual text-LIKE fuzziness (English query →
+    // Swedish product name). Aliases are stored lowercase. UNIQUE(alias)
+    // means one keyword can map to at most one product; to express "milk
+    // could be either oat or lactose-free", use two distinct aliases like
+    // 'havremjölk' and 'laktosfri mjölk' instead.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS product_aliases (
+        alias TEXT PRIMARY KEY,
+        product_code TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (product_code) REFERENCES products(product_code)
+      );
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_product_aliases_product_code
+        ON product_aliases(product_code);
     `);
 
     // Categories master table
@@ -354,45 +401,170 @@ class WillysDatabase {
       CREATE INDEX IF NOT EXISTS idx_categories_name_normalized ON categories(name_normalized);
     `);
 
-    console.log("Relational schema created successfully");
+    console.error("Relational schema created successfully");
   }
 
   private createVectorSchema() {
-    // Create virtual table for vector similarity search
-    // Using 1536 dimensions for OpenAI text-embedding-3-small
+    // 384 dims matches intfloat/multilingual-e5-small in the willys-embeddings
+    // sidecar. Auto-migrate from any previous dimensionality: detect the old
+    // schema via product_vectors_info row count + chunk shape and DROP/recreate
+    // when it doesn't match. The vector table is purely derived data — losing
+    // it just means we re-embed from `products`.
+    const TARGET_DIM = 384;
+    let needsRecreate = false;
+
+    try {
+      // Probe if the table already exists with a compatible schema.
+      const exists = this.db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name='product_vectors'`,
+        )
+        .get();
+      if (exists) {
+        // Try inserting a dummy vector of the target dim — if it errors with a
+        // dimension mismatch, we know we need to recreate.
+        try {
+          const probe = `[${new Array(TARGET_DIM).fill(0).join(",")}]`;
+          this.db.exec("BEGIN");
+          this.db
+            .prepare(
+              `INSERT OR REPLACE INTO product_vectors (product_code, name_embedding) VALUES (?, ?)`,
+            )
+            .run("__schema_probe__", probe);
+          this.db
+            .prepare(`DELETE FROM product_vectors WHERE product_code = ?`)
+            .run("__schema_probe__");
+          this.db.exec("COMMIT");
+        } catch (probeErr) {
+          this.db.exec("ROLLBACK");
+          needsRecreate = true;
+          console.error(
+            `product_vectors dim mismatch (${probeErr instanceof Error ? probeErr.message : probeErr}) — recreating at ${TARGET_DIM} dims`,
+          );
+        }
+      }
+    } catch (_e) {
+      // First run; CREATE below will handle it.
+    }
+
+    if (needsRecreate) {
+      this.db.exec(`DROP TABLE IF EXISTS product_vectors`);
+    }
+
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS product_vectors USING vec0(
         product_code TEXT PRIMARY KEY,
-        name_embedding float[1536]
+        name_embedding float[${TARGET_DIM}]
       );
     `);
 
-    console.log("Vector schema created successfully");
+    console.error(`Vector schema ready (${TARGET_DIM} dims)`);
   }
 
   private migrateProductsTable() {
     try {
-      // Check if products table needs vector columns
       const tableInfo = this.db
         .prepare("PRAGMA table_info(products)")
         .all() as any[];
+
       const hasEmbeddingColumn = tableInfo.some(
         (col) => col.name === "name_embedding",
       );
-
       if (!hasEmbeddingColumn) {
-        console.log("Adding vector support columns to products table...");
-
+        console.error("Adding vector support columns to products table...");
         this.db.exec(`
           ALTER TABLE products ADD COLUMN name_embedding BLOB;
           ALTER TABLE products ADD COLUMN embedding_generated_at INTEGER;
         `);
+        console.error("Products table embedding-columns migration done");
+      }
 
-        console.log("Products table migration completed successfully");
+      // stale_at: set by markProductStale() when an add_to_cart fails for a
+      // cached code. smartSearchProducts / vectorSearchProducts / hybrid skip
+      // any row with stale_at NOT NULL, so the LLM never gets handed a code
+      // we already know is dead.
+      const hasStaleColumn = tableInfo.some((col) => col.name === "stale_at");
+      if (!hasStaleColumn) {
+        console.error("Adding stale_at column to products table...");
+        this.db.exec(`ALTER TABLE products ADD COLUMN stale_at INTEGER`);
+        console.error("Products table stale_at migration done");
+      }
+
+      // preferred_at: set by the preferred-list tools. The LLM is expected
+      // to consult the preferred list first for "add X to cart" requests
+      // before falling back to live API search. NULL = not preferred.
+      const hasPreferredColumn = tableInfo.some(
+        (col) => col.name === "preferred_at",
+      );
+      if (!hasPreferredColumn) {
+        console.error("Adding preferred_at column to products table...");
+        this.db.exec(`ALTER TABLE products ADD COLUMN preferred_at INTEGER`);
+        console.error("Products table preferred_at migration done");
+      }
+
+      // category: free-text category label as returned by Willys' search /
+      // cart APIs (e.g. "Smör & Margarin", "Mejeri"). Indexed for LIKE
+      // matching in resolvePreferred so a query like "baking" can hit a
+      // product whose name doesn't contain "baking" but whose category does.
+      const hasCategoryColumn = tableInfo.some(
+        (col) => col.name === "category",
+      );
+      if (!hasCategoryColumn) {
+        console.error("Adding category column to products table...");
+        this.db.exec(`ALTER TABLE products ADD COLUMN category TEXT`);
+        console.error("Products table category migration done");
+      }
+
+      // description: full produktinformation text from Willys' product detail
+      // endpoint (ingredients, description, marketing copy). Fed into the
+      // embedding so vector search hits on words like "baking" / "matlagning"
+      // that aren't in the product name. Fetched lazily by enrichPreferredItem.
+      const hasDescriptionColumn = tableInfo.some(
+        (col) => col.name === "description",
+      );
+      if (!hasDescriptionColumn) {
+        console.error("Adding description column to products table...");
+        this.db.exec(`ALTER TABLE products ADD COLUMN description TEXT`);
+        this.db.exec(
+          `ALTER TABLE products ADD COLUMN description_fetched_at INTEGER`,
+        );
+        console.error("Products table description migration done");
+      }
+
+      // Backfill category from order_products → categories for any row
+      // missing one. Idempotent (no-op when there's nothing to fill);
+      // running on every startup is cheap and self-healing if new orders
+      // get ingested after this column existed.
+      try {
+        const r = this.db
+          .prepare(
+            `UPDATE products SET category = (
+               SELECT c.name
+                 FROM order_products op
+                 JOIN categories c ON op.category_id = c.category_id
+                WHERE op.product_code = products.product_code
+                LIMIT 1
+             )
+             WHERE category IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM order_products op
+                 WHERE op.product_code = products.product_code
+               )`,
+          )
+          .run();
+        if (r.changes > 0) {
+          console.error(
+            `Backfilled category for ${r.changes} products from order_products.`,
+          );
+        }
+      } catch (e) {
+        console.error(
+          `Category backfill failed (non-fatal): ${e instanceof Error ? e.message : e}`,
+        );
       }
     } catch (error) {
       // Products table might not exist yet, will be created later
-      console.log(
+      console.error(
         "Products table migration not needed or failed:",
         error instanceof Error ? error.message : String(error),
       );
@@ -409,7 +581,7 @@ class WillysDatabase {
         .get() as any;
 
       if (tableInfo?.sql.includes("FOREIGN KEY")) {
-        console.log(
+        console.error(
           "Migrating order_cache table to remove foreign key constraint...",
         );
 
@@ -442,10 +614,10 @@ class WillysDatabase {
         // Clean up backup
         this.db.exec("DROP TABLE order_cache_backup;");
 
-        console.log("Migration completed successfully");
+        console.error("Migration completed successfully");
       }
     } catch (error) {
-      console.log(
+      console.error(
         "No migration needed or migration failed:",
         error instanceof Error ? error.message : String(error),
       );
@@ -605,7 +777,7 @@ class WillysDatabase {
     const deletedOrders = orderCacheStmt.run(now).changes;
 
     if (deletedSessions > 0 || deletedOrders > 0) {
-      console.log(
+      console.error(
         `Database cleanup: removed ${deletedSessions} expired sessions and ${deletedOrders} expired order cache entries`,
       );
     }
@@ -613,7 +785,7 @@ class WillysDatabase {
 
   // Migration methods
   migrateExistingCacheToRelational(): { migrated: number; errors: number } {
-    console.log(
+    console.error(
       "Starting migration of existing cache data to relational format...",
     );
 
@@ -628,7 +800,7 @@ class WillysDatabase {
     `);
 
     const cacheEntries = cacheStmt.all(Date.now()) as any[];
-    console.log(`Found ${cacheEntries.length} cached orders to migrate`);
+    console.error(`Found ${cacheEntries.length} cached orders to migrate`);
 
     for (const entry of cacheEntries) {
       try {
@@ -640,7 +812,7 @@ class WillysDatabase {
           migrated++;
 
           if (migrated % 10 === 0) {
-            console.log(
+            console.error(
               `Migrated ${migrated}/${cacheEntries.length} orders...`,
             );
           }
@@ -651,7 +823,7 @@ class WillysDatabase {
       }
     }
 
-    console.log(
+    console.error(
       `Migration completed: ${migrated} orders migrated, ${errors} errors`,
     );
     return { migrated, errors };
@@ -696,7 +868,7 @@ class WillysDatabase {
   async generateMissingEmbeddings(
     batchSize: number = 50,
   ): Promise<{ processed: number; errors: number }> {
-    console.log(
+    console.error(
       "Starting embedding generation for products without embeddings...",
     );
 
@@ -716,7 +888,7 @@ class WillysDatabase {
         product_code: string;
         name: string;
       }>;
-      console.log(`Found ${products.length} products needing embeddings`);
+      console.error(`Found ${products.length} products needing embeddings`);
 
       if (products.length === 0) {
         return { processed: 0, errors: 0 };
@@ -728,7 +900,7 @@ class WillysDatabase {
         const productNames = batch.map((p) => p.name);
 
         try {
-          console.log(
+          console.error(
             `Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(products.length / batchSize)} (${batch.length} products)`,
           );
 
@@ -770,7 +942,7 @@ class WillysDatabase {
           transaction();
           processed += batch.length;
 
-          console.log(`Processed ${processed}/${products.length} products`);
+          console.error(`Processed ${processed}/${products.length} products`);
 
           // Rate limiting between batches
           if (i + batchSize < products.length) {
@@ -782,7 +954,7 @@ class WillysDatabase {
         }
       }
 
-      console.log(
+      console.error(
         `Embedding generation completed: ${processed} processed, ${errors} errors`,
       );
     } catch (error) {
@@ -945,7 +1117,7 @@ class WillysDatabase {
     orderHistory: string[];
   }> {
     const stmt = this.db.prepare(`
-      SELECT 
+      SELECT
         p.product_code,
         p.name,
         p.manufacturer,
@@ -954,10 +1126,10 @@ class WillysDatabase {
         SUM(CASE WHEN op.purchased_at > ? THEN 1 ELSE 0 END) as recent_purchases,
         GROUP_CONCAT(DISTINCT op.order_number) as order_history
       FROM products p
-      JOIN order_products op ON p.product_code = op.product_code  
-      WHERE p.name_normalized LIKE ?
+      JOIN order_products op ON p.product_code = op.product_code
+      WHERE p.name_normalized LIKE ? AND p.stale_at IS NULL
       GROUP BY p.product_code, p.name, p.manufacturer
-      ORDER BY 
+      ORDER BY
         frequency DESC,
         last_purchased DESC
       LIMIT ?
@@ -995,32 +1167,33 @@ class WillysDatabase {
     }>
   > {
     await this.ensureInitialized();
+    // LEFT JOIN so the cache also returns products the LLM has searched for
+    // but never actually ordered (Fix 3). The frequency/recency parts of the
+    // score collapse to zero in that case, which is fine — the exact-match
+    // bonus still puts a strong text hit at the top.
     const stmt = this.db.prepare(`
-      SELECT 
+      SELECT
         p.product_code,
         p.name,
         p.manufacturer,
-        COUNT(*) as frequency,
+        COUNT(op.product_code) as frequency,
         MAX(op.purchased_at) as last_purchased,
         SUM(CASE WHEN op.purchased_at > ? THEN 1 ELSE 0 END) as recent_purchases,
         -- Scoring algorithm
         (
-          -- Frequency score (higher is better)
-          (COUNT(*) * 10) +
-          -- Recency score (recent purchases boost score)
+          (COUNT(op.product_code) * 10) +
           (SUM(CASE WHEN op.purchased_at > ? THEN 5 ELSE 0 END)) +
-          -- Exact match bonus
-          (CASE 
-            WHEN LOWER(p.name) LIKE ? THEN 20 
+          (CASE
+            WHEN LOWER(p.name) LIKE ? THEN 20
             WHEN LOWER(p.name) LIKE ? THEN 15
-            ELSE 0 
+            ELSE 0
           END)
         ) as score
       FROM products p
-      JOIN order_products op ON p.product_code = op.product_code  
-      WHERE p.name_normalized LIKE ?
+      LEFT JOIN order_products op ON p.product_code = op.product_code
+      WHERE p.name_normalized LIKE ? AND p.stale_at IS NULL
       GROUP BY p.product_code, p.name, p.manufacturer
-      ORDER BY 
+      ORDER BY
         score DESC,
         frequency DESC,
         last_purchased DESC
@@ -1137,7 +1310,7 @@ class WillysDatabase {
 
     // Return empty results if vector support is not available
     if (!this.vectorSupport) {
-      console.log(
+      console.error(
         "Vector search requested but sqlite-vec not available, returning empty results",
       );
       return [];
@@ -1151,7 +1324,7 @@ class WillysDatabase {
 
       // Perform vector similarity search using vec0 syntax
       const stmt = this.db.prepare(`
-        SELECT 
+        SELECT
           pv.product_code,
           p.name,
           p.manufacturer,
@@ -1160,6 +1333,7 @@ class WillysDatabase {
         JOIN products p ON pv.product_code = p.product_code
         WHERE pv.name_embedding MATCH ?
         AND k = ?
+        AND p.stale_at IS NULL
         ORDER BY distance ASC
       `);
 
@@ -1321,6 +1495,556 @@ class WillysDatabase {
       embeddedProducts,
       vectorRecords,
     };
+  }
+
+  // ─── Fix 3: cache catalogue-search results ──────────────────────────────
+  // Called by mcpSearchProducts() after every successful Willys API call.
+  // Upserts each product into `products`. INSERT OR IGNORE preserves existing
+  // rows (their manufacturer / embeddings / order_products FK refs); the
+  // separate UPDATE clears any prior `stale_at` if the product reappears in
+  // a search (Willys re-added it, our previous "stale" marker was wrong).
+  cacheProductsFromSearch(
+    products: Array<{
+      code?: string;
+      name?: string;
+      manufacturer?: string | null;
+      category?: string | null;
+    }>,
+  ): { inserted: number; revived: number } {
+    if (!this.initialized) {
+      // Search can fire before async ensureInitialized() resolves; skip
+      // rather than throw — caching is best-effort.
+      return { inserted: 0, revived: 0 };
+    }
+    const now = Date.now();
+    const insertStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO products
+        (product_code, name, manufacturer, name_normalized, created_at, category)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    // Backfill missing fields on existing rows (category may not have been
+    // captured on first cache) without overwriting non-null values.
+    const updateMetaStmt = this.db.prepare(`
+      UPDATE products SET
+        category = COALESCE(category, ?),
+        manufacturer = COALESCE(manufacturer, ?)
+      WHERE product_code = ?
+    `);
+    const reviveStmt = this.db.prepare(`
+      UPDATE products SET stale_at = NULL WHERE product_code = ? AND stale_at IS NOT NULL
+    `);
+    let inserted = 0;
+    let revived = 0;
+    const tx = this.db.transaction(() => {
+      for (const p of products) {
+        if (!p.code || !p.name) continue;
+        const result = insertStmt.run(
+          p.code,
+          p.name,
+          p.manufacturer || null,
+          p.name.toLowerCase(),
+          now,
+          p.category || null,
+        );
+        if (result.changes > 0) inserted++;
+        else updateMetaStmt.run(p.category || null, p.manufacturer || null, p.code);
+        const r = reviveStmt.run(p.code);
+        if (r.changes > 0) revived++;
+      }
+    });
+    tx();
+    return { inserted, revived };
+  }
+
+  getProductNameByCode(productCode: string): string | null {
+    if (!this.initialized) return null;
+    const row = this.db
+      .prepare("SELECT name FROM products WHERE product_code = ?")
+      .get(productCode) as { name?: string } | undefined;
+    return row?.name ?? null;
+  }
+
+  markProductStale(productCode: string): void {
+    if (!this.initialized) return;
+    this.db
+      .prepare("UPDATE products SET stale_at = ? WHERE product_code = ?")
+      .run(Date.now(), productCode);
+  }
+
+  // Helper for the startup backfill (Fix 2): used by mcp-server.ts to decide
+  // whether to walk the user's order history. Doesn't touch session state.
+  countOrders(): number {
+    if (!this.initialized) return 0;
+    const row = this.db
+      .prepare("SELECT COUNT(*) as n FROM orders")
+      .get() as { n: number };
+    return row.n;
+  }
+
+  // ─── Preferred-list system ──────────────────────────────────────────────
+  // A curated subset of `products` marked with `preferred_at`. The LLM is
+  // expected to consult preferred FIRST when the user asks to add something
+  // to the cart, so common groceries get the *exact* product the user wants
+  // (specific brand, milkfat %, etc.) without re-querying Willys.
+
+  // Upsert the product row and mark it preferred. `overwriteTimestamp`
+  // controls whether an existing preferred_at gets refreshed — set true
+  // for explicit re-marks (single add, replace), false for the bulk
+  // "update from cart" flow that's supposed to be insert-only.
+  addPreferred(
+    productCode: string,
+    name: string,
+    manufacturer?: string | null,
+    options: { overwriteTimestamp?: boolean; category?: string | null } = {},
+  ): { newlyPreferred: boolean } {
+    if (!this.initialized) return { newlyPreferred: false };
+    const overwrite = options.overwriteTimestamp !== false;
+    const now = Date.now();
+    // Ensure the product row exists. INSERT OR IGNORE preserves any
+    // existing manufacturer / stale_at / embedding columns.
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO products
+           (product_code, name, manufacturer, name_normalized, created_at, category)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        productCode,
+        name,
+        manufacturer || null,
+        name.toLowerCase(),
+        now,
+        options.category || null,
+      );
+    // Backfill metadata on existing rows (without clobbering non-null values).
+    this.db
+      .prepare(
+        `UPDATE products SET
+           category = COALESCE(category, ?),
+           manufacturer = COALESCE(manufacturer, ?)
+         WHERE product_code = ?`,
+      )
+      .run(options.category || null, manufacturer || null, productCode);
+
+    const sql = overwrite
+      ? `UPDATE products SET preferred_at = ? WHERE product_code = ?`
+      : `UPDATE products SET preferred_at = ?
+           WHERE product_code = ? AND preferred_at IS NULL`;
+    const r = this.db.prepare(sql).run(now, productCode);
+    return { newlyPreferred: r.changes > 0 };
+  }
+
+  removePreferred(productCode: string): boolean {
+    if (!this.initialized) return false;
+    const r = this.db
+      .prepare(
+        `UPDATE products SET preferred_at = NULL
+           WHERE product_code = ? AND preferred_at IS NOT NULL`,
+      )
+      .run(productCode);
+    return r.changes > 0;
+  }
+
+  clearAllPreferred(): number {
+    if (!this.initialized) return 0;
+    const r = this.db
+      .prepare(`UPDATE products SET preferred_at = NULL WHERE preferred_at IS NOT NULL`)
+      .run();
+    return r.changes;
+  }
+
+  listPreferred(): Array<{
+    productCode: string;
+    name: string;
+    manufacturer: string | null;
+    preferredAt: number;
+  }> {
+    if (!this.initialized) return [];
+    return (this.db
+      .prepare(
+        `SELECT product_code, name, manufacturer, preferred_at
+           FROM products
+           WHERE preferred_at IS NOT NULL AND stale_at IS NULL
+           ORDER BY preferred_at ASC`,
+      )
+      .all() as any[]).map((r) => ({
+      productCode: r.product_code,
+      name: r.name,
+      manufacturer: r.manufacturer,
+      preferredAt: r.preferred_at,
+    }));
+  }
+
+  // Returns the subset of `codes` that are currently preferred (and not
+  // stale). Used by the Willys-search fallback in mcp__willys_preferred_add
+  // to intersect live search results with the user's preferred list.
+  filterPreferredByCodes(
+    codes: string[],
+  ): Array<{ productCode: string; name: string; manufacturer: string | null }> {
+    if (!this.initialized || codes.length === 0) return [];
+    const placeholders = codes.map(() => "?").join(",");
+    const stmt = this.db.prepare(
+      `SELECT product_code, name, manufacturer
+         FROM products
+         WHERE preferred_at IS NOT NULL
+           AND stale_at IS NULL
+           AND product_code IN (${placeholders})
+         ORDER BY preferred_at ASC`,
+    );
+    return (stmt.all(...codes) as any[]).map((r) => ({
+      productCode: r.product_code,
+      name: r.name,
+      manufacturer: r.manufacturer,
+    }));
+  }
+
+  searchPreferred(
+    query: string,
+    maxResults: number = 5,
+  ): Array<{
+    productCode: string;
+    name: string;
+    manufacturer: string | null;
+  }> {
+    if (!this.initialized) return [];
+    const stmt = this.db.prepare(
+      `SELECT product_code, name, manufacturer
+         FROM products
+         WHERE preferred_at IS NOT NULL
+           AND stale_at IS NULL
+           AND name_normalized LIKE ?
+         ORDER BY
+           CASE
+             WHEN LOWER(name) LIKE ? THEN 0
+             WHEN LOWER(name) LIKE ? THEN 1
+             ELSE 2
+           END,
+           preferred_at ASC
+         LIMIT ?`,
+    );
+    const q = query.toLowerCase();
+    return (stmt.all(`%${q}%`, q, `${q}%`, maxResults) as any[]).map((r) => ({
+      productCode: r.product_code,
+      name: r.name,
+      manufacturer: r.manufacturer,
+    }));
+  }
+
+  // ─── Cart-history log (drives "preferred_add_last_cart_item") ───────────
+  logCartAddition(productCode: string, name?: string | null): void {
+    if (!this.initialized) return;
+    this.db
+      .prepare(
+        `INSERT INTO cart_history (product_code, name, added_at) VALUES (?, ?, ?)`,
+      )
+      .run(productCode, name || null, Date.now());
+  }
+
+  getLastCartAddition(): { productCode: string; name: string | null } | null {
+    if (!this.initialized) return null;
+    const row = this.db
+      .prepare(
+        `SELECT product_code, name FROM cart_history ORDER BY added_at DESC LIMIT 1`,
+      )
+      .get() as any;
+    if (!row) return null;
+    return { productCode: row.product_code, name: row.name };
+  }
+
+  // ─── Aliases ────────────────────────────────────────────────────────────
+  addAlias(
+    alias: string,
+    productCode: string,
+  ): { ok: boolean; reason?: string } {
+    if (!this.initialized) return { ok: false, reason: "db not initialized" };
+    const normalized = alias.trim().toLowerCase();
+    if (!normalized) return { ok: false, reason: "empty alias" };
+    // Make sure the product exists — otherwise the alias is a dangling pointer.
+    const exists = this.db
+      .prepare(`SELECT 1 FROM products WHERE product_code = ?`)
+      .get(productCode);
+    if (!exists) {
+      return {
+        ok: false,
+        reason: `product code ${productCode} not in cache (alias must reference a known product)`,
+      };
+    }
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO product_aliases (alias, product_code, created_at) VALUES (?, ?, ?)`,
+        )
+        .run(normalized, productCode, Date.now());
+      return { ok: true };
+    } catch (err) {
+      // UNIQUE violation: alias already taken.
+      const existing = this.db
+        .prepare(`SELECT product_code FROM product_aliases WHERE alias = ?`)
+        .get(normalized) as { product_code?: string } | undefined;
+      return {
+        ok: false,
+        reason: `alias "${normalized}" is already mapped to ${existing?.product_code ?? "another product"} — remove it first if you want to remap`,
+      };
+    }
+  }
+
+  removeAlias(alias: string): boolean {
+    if (!this.initialized) return false;
+    const r = this.db
+      .prepare(`DELETE FROM product_aliases WHERE alias = ?`)
+      .run(alias.trim().toLowerCase());
+    return r.changes > 0;
+  }
+
+  listAliases(
+    productCode?: string,
+  ): Array<{ alias: string; productCode: string; name: string | null }> {
+    if (!this.initialized) return [];
+    const stmt = productCode
+      ? this.db.prepare(
+          `SELECT a.alias, a.product_code, p.name
+             FROM product_aliases a
+             LEFT JOIN products p ON a.product_code = p.product_code
+             WHERE a.product_code = ?
+             ORDER BY a.created_at ASC`,
+        )
+      : this.db.prepare(
+          `SELECT a.alias, a.product_code, p.name
+             FROM product_aliases a
+             LEFT JOIN products p ON a.product_code = p.product_code
+             ORDER BY a.alias ASC`,
+        );
+    const rows = (productCode ? stmt.all(productCode) : stmt.all()) as any[];
+    return rows.map((r) => ({
+      alias: r.alias,
+      productCode: r.product_code,
+      name: r.name ?? null,
+    }));
+  }
+
+  // The one-shot lookup that powers `mcp__willys_preferred_add`.
+  // Strategy (cheapest → fuzziest):
+  //   1. Exact alias match (case-insensitive).
+  //   2. Preferred-list name search (text LIKE %query%, stale_at IS NULL).
+  // Dedupes by product_code so an item that matches both as alias *and* via
+  // its name only appears once. Caller decides whether 1 result = add,
+  // 2+ = ask the user.
+  resolvePreferred(
+    query: string,
+    maxResults: number = 5,
+  ): Array<{
+    productCode: string;
+    name: string;
+    manufacturer: string | null;
+    matchedBy: "alias" | "name" | "category";
+  }> {
+    if (!this.initialized) return [];
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return [];
+
+    const seen = new Set<string>();
+    const out: Array<{
+      productCode: string;
+      name: string;
+      manufacturer: string | null;
+      matchedBy: "alias" | "name" | "category";
+    }> = [];
+
+    // 1) Exact alias match.
+    const aliasMatch = this.db
+      .prepare(
+        `SELECT a.product_code, p.name, p.manufacturer
+           FROM product_aliases a
+           JOIN products p ON a.product_code = p.product_code
+           WHERE a.alias = ? AND p.stale_at IS NULL`,
+      )
+      .get(normalized) as any;
+    if (aliasMatch) {
+      out.push({
+        productCode: aliasMatch.product_code,
+        name: aliasMatch.name,
+        manufacturer: aliasMatch.manufacturer,
+        matchedBy: "alias",
+      });
+      seen.add(aliasMatch.product_code);
+    }
+
+    // 2) Preferred-name or category text search. Name matches outrank
+    // category matches via the ORDER BY CASE so a query like "kaffe" prefers
+    // a coffee-named product over something merely in the "Kaffe" category.
+    const nameRows = this.db
+      .prepare(
+        `SELECT product_code, name, manufacturer, category,
+            CASE
+              WHEN name_normalized LIKE ? THEN 'name'
+              WHEN LOWER(IFNULL(category, '')) LIKE ? THEN 'category'
+              ELSE 'other'
+            END AS match_source
+           FROM products
+           WHERE preferred_at IS NOT NULL
+             AND stale_at IS NULL
+             AND (name_normalized LIKE ? OR LOWER(IFNULL(category, '')) LIKE ?)
+           ORDER BY
+             CASE
+               WHEN LOWER(name) = ? THEN 0
+               WHEN LOWER(name) LIKE ? THEN 1
+               WHEN name_normalized LIKE ? THEN 2
+               ELSE 3
+             END,
+             preferred_at ASC
+           LIMIT ?`,
+      )
+      .all(
+        `%${normalized}%`,
+        `%${normalized}%`,
+        `%${normalized}%`,
+        `%${normalized}%`,
+        normalized,
+        `${normalized}%`,
+        `%${normalized}%`,
+        maxResults,
+      ) as any[];
+    for (const r of nameRows) {
+      if (seen.has(r.product_code)) continue;
+      out.push({
+        productCode: r.product_code,
+        name: r.name,
+        manufacturer: r.manufacturer,
+        matchedBy: r.match_source === "category" ? "category" : "name",
+      });
+      seen.add(r.product_code);
+      if (out.length >= maxResults) break;
+    }
+
+    return out;
+  }
+
+  // ─── Description + embedding for preferred items ───────────────────────
+  // Persists the produktinformation text. Called by mcp-server.ts's
+  // enrichPreferredItem after a successful mcpGetProductDetail.
+  storeProductDescription(productCode: string, description: string): void {
+    if (!this.initialized) return;
+    this.db
+      .prepare(
+        `UPDATE products SET description = ?, description_fetched_at = ? WHERE product_code = ?`,
+      )
+      .run(description, Date.now(), productCode);
+  }
+
+  // Persists the embedding into BOTH the products column (BLOB, for migration
+  // and debugging) and the vec0 virtual table (which actually drives k-NN).
+  storeProductEmbedding(
+    productCode: string,
+    embedding: Float32Array,
+  ): void {
+    if (!this.initialized || !this.vectorSupport) return;
+    const blob = Buffer.from(embedding.buffer);
+    const arrayLiteral = `[${Array.from(embedding).join(",")}]`;
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE products SET name_embedding = ?, embedding_generated_at = ? WHERE product_code = ?`,
+        )
+        .run(blob, Date.now(), productCode);
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO product_vectors (product_code, name_embedding) VALUES (?, ?)`,
+        )
+        .run(productCode, arrayLiteral);
+    });
+    tx();
+  }
+
+  // Preferred items that still need to be embedded. Drives the startup
+  // backfill in mcp-server.ts.
+  listPreferredMissingEmbedding(): Array<{
+    productCode: string;
+    name: string;
+    manufacturer: string | null;
+    category: string | null;
+    description: string | null;
+  }> {
+    if (!this.initialized) return [];
+    return (this.db
+      .prepare(
+        `SELECT product_code, name, manufacturer, category, description
+           FROM products
+           WHERE preferred_at IS NOT NULL
+             AND stale_at IS NULL
+             AND embedding_generated_at IS NULL`,
+      )
+      .all() as any[]).map((r) => ({
+      productCode: r.product_code,
+      name: r.name,
+      manufacturer: r.manufacturer,
+      category: r.category,
+      description: r.description,
+    }));
+  }
+
+  // Preferred items that need description fetched (from Willys product detail).
+  listPreferredMissingDescription(): Array<{
+    productCode: string;
+    name: string;
+  }> {
+    if (!this.initialized) return [];
+    return (this.db
+      .prepare(
+        `SELECT product_code, name FROM products
+           WHERE preferred_at IS NOT NULL
+             AND stale_at IS NULL
+             AND description_fetched_at IS NULL`,
+      )
+      .all() as any[]).map((r) => ({
+      productCode: r.product_code,
+      name: r.name,
+    }));
+  }
+
+  // K-NN search filtered to preferred-only, stale-skipped. Returns ordered
+  // list with similarity in [0, 1] (cosine, derived from vec0 L2 distance on
+  // unit-normalized vectors: similarity = 1 - distance/2).
+  // Callers should apply a confidence threshold (~0.75 is sensible for
+  // multilingual-e5-small on grocery queries) before treating as a hit.
+  vectorSearchPreferred(
+    queryEmbedding: Float32Array,
+    maxResults: number = 5,
+  ): Array<{
+    productCode: string;
+    name: string;
+    manufacturer: string | null;
+    similarity: number;
+  }> {
+    if (!this.initialized || !this.vectorSupport) return [];
+    try {
+      const arrayLiteral = `[${Array.from(queryEmbedding).join(",")}]`;
+      const stmt = this.db.prepare(
+        `SELECT
+           pv.product_code,
+           p.name,
+           p.manufacturer,
+           distance AS d
+         FROM product_vectors pv
+         JOIN products p ON pv.product_code = p.product_code
+         WHERE pv.name_embedding MATCH ?
+           AND k = ?
+           AND p.preferred_at IS NOT NULL
+           AND p.stale_at IS NULL
+         ORDER BY distance ASC`,
+      );
+      const rows = stmt.all(arrayLiteral, maxResults) as any[];
+      return rows.map((r) => ({
+        productCode: r.product_code,
+        name: r.name,
+        manufacturer: r.manufacturer,
+        similarity: Math.max(0, 1 - r.d / 2),
+      }));
+    } catch (e) {
+      console.error(
+        `vectorSearchPreferred failed: ${e instanceof Error ? e.message : e}`,
+      );
+      return [];
+    }
   }
 
   // Close database connection

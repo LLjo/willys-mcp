@@ -126,7 +126,7 @@ export class OrderCache {
           order.orderDetails,
         );
       }
-      console.log(`Preloaded ${orders.length} orders into cache`);
+      console.error(`Preloaded ${orders.length} orders into cache`);
     } catch (error) {
       console.error("Error preloading orders:", error);
     }

@@ -1,203 +1,132 @@
 /**
- * Embedding utility functions for vector-based product search
- * Uses OpenAI's text-embedding-3-small model for generating embeddings
+ * Embedding utility — talks to the local willys-embeddings sidecar
+ * (intfloat/multilingual-e5-small, 384 dims, multilingual). No external API.
+ *
+ * The sidecar URL comes from WILLYS_EMBED_URL (default http://willys-embeddings:8097
+ * which is the compose-network hostname).
+ *
+ * IMPORTANT: e5 models want different prefixes for query vs passage. Use
+ * `generateQueryEmbedding` for the user's text at search time, and
+ * `generatePassageEmbeddingsBatch` when indexing catalogue items. Symmetric
+ * similarity without the prefixes is measurably worse.
  */
 
-import OpenAI from "openai";
+const EMBED_URL =
+  process.env.WILLYS_EMBED_URL || "http://willys-embeddings:8097";
+const EMBED_DIM = 384;
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Cache for embeddings to avoid redundant API calls
 const embeddingCache = new Map<string, Float32Array>();
 
-/**
- * Generate embedding vector for text using OpenAI API
- * @param text - Text to generate embedding for
- * @returns Float32Array vector (1536 dimensions for text-embedding-3-small)
- */
-export async function generateEmbedding(text: string): Promise<Float32Array> {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY environment variable is not set");
-  }
-
-  // Normalize text for consistent embeddings
-  const normalizedText = text
+function normalize(text: string): string {
+  return text
     .trim()
     .toLowerCase()
     .replace(/[\n\r\t]/g, " ")
     .replace(/\s+/g, " ");
-
-  // Check cache first
-  const cachedEmbedding = embeddingCache.get(normalizedText);
-  if (cachedEmbedding !== undefined) {
-    console.log(`Embedding cache hit for: "${normalizedText}"`);
-    return cachedEmbedding;
-  }
-
-  console.log(`Generating embedding for: "${normalizedText}"`);
-
-  try {
-    const response = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: normalizedText,
-      encoding_format: "float",
-    });
-
-    const embedding = new Float32Array(response.data[0].embedding);
-
-    // Cache the result
-    embeddingCache.set(normalizedText, embedding);
-
-    return embedding;
-  } catch (error) {
-    console.error("Error generating embedding:", error);
-    throw error;
-  }
 }
 
-/**
- * Generate embeddings for multiple texts in batch
- * @param texts - Array of texts to generate embeddings for
- * @param batchSize - Number of texts to process per API call (max 100)
- * @returns Array of Float32Array vectors
- */
-export async function generateEmbeddingsBatch(
+async function callEmbed(
   texts: string[],
-  batchSize: number = 50,
+  kind: "query" | "passage",
 ): Promise<Float32Array[]> {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY environment variable is not set");
+  const res = await fetch(`${EMBED_URL}/embed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ texts, kind }),
+  });
+  if (!res.ok) {
+    throw new Error(`Embed service ${res.status}: ${await res.text()}`);
   }
-
-  const results: Float32Array[] = [];
-  const normalizedTexts = texts.map((text) =>
-    text
-      .trim()
-      .toLowerCase()
-      .replace(/[\n\r\t]/g, " ")
-      .replace(/\s+/g, " "),
-  );
-
-  // Process in batches to respect API limits and cache hits
-  for (let i = 0; i < normalizedTexts.length; i += batchSize) {
-    const batch = normalizedTexts.slice(i, i + batchSize);
-    const batchTexts: string[] = [];
-    const batchIndices: number[] = [];
-
-    // Check cache for each item in batch
-    const batchResults: Float32Array[] = new Array(batch.length);
-
-    for (let j = 0; j < batch.length; j++) {
-      const text = batch[j];
-      const cachedEmbedding = embeddingCache.get(text);
-      if (cachedEmbedding !== undefined) {
-        console.log(`Batch cache hit for: "${text}"`);
-        batchResults[j] = cachedEmbedding;
-      } else {
-        batchTexts.push(text);
-        batchIndices.push(j);
-      }
-    }
-
-    // Generate embeddings for non-cached items
-    if (batchTexts.length > 0) {
-      console.log(`Generating batch embeddings for ${batchTexts.length} texts`);
-
-      try {
-        const response = await openai.embeddings.create({
-          model: "text-embedding-3-small",
-          input: batchTexts,
-          encoding_format: "float",
-        });
-
-        // Process batch response
-        for (let k = 0; k < response.data.length; k++) {
-          const embedding = new Float32Array(response.data[k].embedding);
-          const originalIndex = batchIndices[k];
-          const text = batchTexts[k];
-
-          batchResults[originalIndex] = embedding;
-          embeddingCache.set(text, embedding);
-        }
-      } catch (error) {
-        console.error("Error generating batch embeddings:", error);
-        throw error;
-      }
-    }
-
-    results.push(...batchResults);
-
-    // Rate limiting: wait between batches
-    if (i + batchSize < normalizedTexts.length) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+  const data = (await res.json()) as { embeddings: number[][]; dim: number };
+  if (data.dim !== EMBED_DIM) {
+    throw new Error(
+      `Embed service returned dim=${data.dim}, expected ${EMBED_DIM}. The vec0 table is sized for ${EMBED_DIM}; mismatched models will silently break similarity search.`,
+    );
   }
-
-  return results;
+  return data.embeddings.map((v) => Float32Array.from(v));
 }
 
-/**
- * Convert Float32Array to BLOB format for SQLite storage
- * @param embedding - Float32Array embedding vector
- * @returns Buffer suitable for BLOB storage
- */
+export async function generateQueryEmbedding(
+  text: string,
+): Promise<Float32Array> {
+  const normalized = normalize(text);
+  const cacheKey = `q::${normalized}`;
+  const hit = embeddingCache.get(cacheKey);
+  if (hit) return hit;
+  const [vec] = await callEmbed([normalized], "query");
+  embeddingCache.set(cacheKey, vec);
+  return vec;
+}
+
+export async function generatePassageEmbeddingsBatch(
+  texts: string[],
+  batchSize: number = 32,
+): Promise<Float32Array[]> {
+  const normalized = texts.map(normalize);
+  const out: Float32Array[] = new Array(normalized.length);
+  const need: number[] = [];
+  const needTexts: string[] = [];
+  for (let i = 0; i < normalized.length; i++) {
+    const cacheKey = `p::${normalized[i]}`;
+    const hit = embeddingCache.get(cacheKey);
+    if (hit) out[i] = hit;
+    else {
+      need.push(i);
+      needTexts.push(normalized[i]);
+    }
+  }
+  for (let i = 0; i < needTexts.length; i += batchSize) {
+    const slice = needTexts.slice(i, i + batchSize);
+    const vecs = await callEmbed(slice, "passage");
+    for (let j = 0; j < slice.length; j++) {
+      const idx = need[i + j];
+      out[idx] = vecs[j];
+      embeddingCache.set(`p::${normalized[idx]}`, vecs[j]);
+    }
+  }
+  return out;
+}
+
+// ── Back-compat shims for any code still using the old names. ───────────────
+// They route to the new passage-prefixed variant; the difference vs query-
+// prefixed matters for retrieval quality but not correctness.
+export const generateEmbedding = (text: string) =>
+  generatePassageEmbeddingsBatch([text]).then((v) => v[0]);
+export const generateEmbeddingsBatch = generatePassageEmbeddingsBatch;
+
 export function embeddingToBlob(embedding: Float32Array): Buffer {
   return Buffer.from(embedding.buffer);
 }
 
-/**
- * Convert BLOB from SQLite back to Float32Array
- * @param blob - Buffer from SQLite BLOB column
- * @returns Float32Array embedding vector
- */
 export function blobToEmbedding(blob: Buffer): Float32Array {
   return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
 }
 
-/**
- * Calculate cosine similarity between two embeddings
- * @param embedding1 - First embedding vector
- * @param embedding2 - Second embedding vector
- * @returns Cosine similarity score (0-1, where 1 is most similar)
- */
 export function cosineSimilarity(
-  embedding1: Float32Array,
-  embedding2: Float32Array,
+  a: Float32Array,
+  b: Float32Array,
 ): number {
-  if (embedding1.length !== embedding2.length) {
+  if (a.length !== b.length) {
     throw new Error("Embeddings must have the same dimensions");
   }
-
-  let dotProduct = 0;
-  let norm1 = 0;
-  let norm2 = 0;
-
-  for (let i = 0; i < embedding1.length; i++) {
-    dotProduct += embedding1[i] * embedding2[i];
-    norm1 += embedding1[i] * embedding1[i];
-    norm2 += embedding2[i] * embedding2[i];
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
   }
-
-  const magnitude = Math.sqrt(norm1) * Math.sqrt(norm2);
-  return magnitude === 0 ? 0 : dotProduct / magnitude;
+  const m = Math.sqrt(na) * Math.sqrt(nb);
+  return m === 0 ? 0 : dot / m;
 }
 
-/**
- * Clear the embedding cache (useful for testing)
- */
 export function clearEmbeddingCache(): void {
   embeddingCache.clear();
-  console.log("Embedding cache cleared");
 }
 
-/**
- * Get cache statistics
- */
 export function getEmbeddingCacheStats(): { size: number; keys: string[] } {
-  return {
-    size: embeddingCache.size,
-    keys: Array.from(embeddingCache.keys()),
-  };
+  return { size: embeddingCache.size, keys: Array.from(embeddingCache.keys()) };
 }
+
+export { EMBED_DIM };

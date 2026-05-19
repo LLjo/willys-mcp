@@ -14,7 +14,8 @@ import type {
   WillysOrderItem,
   WillysPickupSlotsResponse,
 } from "@/lib/types";
-import { mcpGetWillysCookies } from "./mcp-auth";
+import { readCredentialsFile } from "./credentials";
+import { mcpAuthenticateWithWillys, mcpGetWillysCookies } from "./mcp-auth";
 import {
   fetchCsrfToken,
   fetchWithRetry,
@@ -28,6 +29,68 @@ import {
 /**
  * MCP-specific order functions that use session store for authentication
  */
+
+function isCsrfOrAuthFailure(status: number, body: string): boolean {
+  // Reauth on the full set of session-stale signatures observed from Willys:
+  // 401/403 (classic auth failures), 419 (session expired in some Axfood
+  // endpoints), and 500-class with csrf body (occasionally returned when the
+  // CSRF token is stale rather than missing). The previous narrow body
+  // check missed cases where the response body didn't lowercase-include
+  // "csrf"/"unauthorized" verbatim, which caused mcpAddToCart to surface a
+  // raw failure to the LLM — once the model sees that, it "learns" within
+  // the conversation to stop calling the tool. Better to retry one too
+  // many times than too few.
+  if (status === 401 || status === 403 || status === 419) return true;
+  const lc = body.toLowerCase();
+  if (lc.includes("csrf")) return true;
+  if (lc.includes("unauthorized")) return true;
+  if (lc.includes("session") && lc.includes("expired")) return true;
+  return false;
+}
+
+async function refreshSession(sessionId: string): Promise<boolean> {
+  const creds = readCredentialsFile();
+  if (!creds) {
+    console.error("Auto-reauth skipped: no .credentials file available");
+    return false;
+  }
+  const result = await mcpAuthenticateWithWillys(sessionId, creds);
+  if (result.success) {
+    console.error(`Auto-reauth succeeded for session ${sessionId}`);
+    return true;
+  }
+  console.error(`Auto-reauth failed: ${result.error ?? "unknown error"}`);
+  return false;
+}
+
+// Run a request that needs a valid session; on CSRF/401 failure, refresh the
+// Willys session via Puppeteer login and retry the request once.
+async function withAuthRefresh(
+  sessionId: string,
+  request: (cookies: string) => Promise<Response>,
+): Promise<Response> {
+  let cookies = await mcpGetWillysCookies(sessionId);
+  if (!cookies) throw new Error("No authentication cookies found");
+
+  const response = await request(cookies);
+  if (response.ok) return response;
+  if (response.status !== 401 && response.status !== 403) return response;
+
+  const body = await response.clone().text();
+  if (!isCsrfOrAuthFailure(response.status, body)) return response;
+
+  console.error(
+    `Auth/CSRF failure (status ${response.status}): ${truncateForLog(body, 80)} — refreshing session...`,
+  );
+  const refreshed = await refreshSession(sessionId);
+  if (!refreshed) return response;
+
+  cookies = await mcpGetWillysCookies(sessionId);
+  if (!cookies) return response;
+
+  console.error("Retrying request after session refresh");
+  return request(cookies);
+}
 
 function parseCurrencyToNumber(value: unknown): number {
   if (typeof value === "number") return value;
@@ -53,7 +116,7 @@ export async function mcpGetOrders(sessionId: string): Promise<WillysOrder[]> {
       throw new Error("No authentication cookies found");
     }
 
-    console.log(
+    console.error(
       "Using MCP cookies for orders request:",
       truncateForLog(cookies, 100),
     );
@@ -68,7 +131,7 @@ export async function mcpGetOrders(sessionId: string): Promise<WillysOrder[]> {
     }
 
     const data = await response.json();
-    console.log("Raw MCP Willys API response:", JSON.stringify(data, null, 2));
+    console.error("Raw MCP Willys API response:", JSON.stringify(data, null, 2));
 
     const rawOrders: RawOrder[] = Array.isArray(data)
       ? data
@@ -227,7 +290,7 @@ export async function mcpGetOrderDetails(
     // Check cache first
     const cachedOrder = orderCache.getCachedOrder(orderNumber);
     if (cachedOrder) {
-      console.log(`Cache hit for order ${orderNumber}`);
+      console.error(`Cache hit for order ${orderNumber}`);
 
       // If cached data is in raw format (has categoryOrderedDeliveredProducts), transform it
       if (cachedOrder.categoryOrderedDeliveredProducts) {
@@ -273,7 +336,7 @@ export async function mcpGetOrderDetails(
       return cachedOrder;
     }
 
-    console.log(`Cache miss for order ${orderNumber}, fetching from API`);
+    console.error(`Cache miss for order ${orderNumber}, fetching from API`);
 
     const cookies = await mcpGetWillysCookies(sessionId);
     if (!cookies) {
@@ -293,7 +356,7 @@ export async function mcpGetOrderDetails(
 
     // Cache the raw data first for compatibility with web interface
     orderCache.setCachedOrder(orderNumber, sessionId, data);
-    console.log(`Cached raw order data for ${orderNumber}`);
+    console.error(`Cached raw order data for ${orderNumber}`);
 
     // Map the detailed order data from categoryOrderedDeliveredProducts
     const items: WillysOrderItem[] = [];
@@ -338,38 +401,34 @@ export async function mcpGetOrderDetails(
   }
 }
 
-export async function mcpAddToCart(
+async function addToCartRaw(
   sessionId: string,
   productCode: string,
-  quantity: number = 1,
+  quantity: number,
 ): Promise<{ success: boolean; message?: string }> {
   try {
-    const cookies = await mcpGetWillysCookies(sessionId);
-    if (!cookies) {
-      throw new Error("No authentication cookies found");
-    }
-
-    const csrfToken = await fetchCsrfToken(cookies);
-    console.log("Retrieved CSRF token:", truncateForLog(csrfToken));
-
-    const response = await fetchWithRetry(
-      "https://www.willys.se/axfood/rest/cart/addProducts",
-      {
-        method: "POST",
-        headers: getApiHeaders(cookies, csrfToken),
-        body: JSON.stringify({
-          products: [
-            {
-              productCodePost: productCode,
-              qty: quantity,
-              pickUnit: "pieces",
-              hideDiscountToolTip: false,
-              noReplacementFlag: false,
-            },
-          ],
-        }),
-      },
-    );
+    const response = await withAuthRefresh(sessionId, async (cookies) => {
+      const csrfToken = await fetchCsrfToken(cookies);
+      console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
+      return fetchWithRetry(
+        "https://www.willys.se/axfood/rest/cart/addProducts",
+        {
+          method: "POST",
+          headers: getApiHeaders(cookies, csrfToken),
+          body: JSON.stringify({
+            products: [
+              {
+                productCodePost: productCode,
+                qty: quantity,
+                pickUnit: "pieces",
+                hideDiscountToolTip: false,
+                noReplacementFlag: false,
+              },
+            ],
+          }),
+        },
+      );
+    });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -388,37 +447,117 @@ export async function mcpAddToCart(
   }
 }
 
+export async function mcpAddToCart(
+  sessionId: string,
+  productCode: string,
+  quantity: number = 1,
+  options: { allowFallback?: boolean } = {},
+): Promise<{ success: boolean; message?: string }> {
+  const allowFallback = options.allowFallback !== false;
+
+  // First attempt with whatever code we were given.
+  const first = await addToCartRaw(sessionId, productCode, quantity);
+  if (first.success) {
+    try {
+      const { willysDatabase } = await import("./database");
+      const name = willysDatabase.getProductNameByCode(productCode);
+      willysDatabase.logCartAddition(productCode, name);
+    } catch (e) {
+      console.error("logCartAddition failed:", e);
+    }
+    return first;
+  }
+  if (!allowFallback) return first;
+
+  // Fix 3: the code came back invalid. If we have a cached name for it,
+  // mark it stale (so future smart-match queries skip it), re-search by
+  // name, and retry against the top fresh result. This handles the case
+  // where Willys rotates product codes / discontinues SKUs without our
+  // cache noticing.
+  const { willysDatabase } = await import("./database");
+  const cachedName = willysDatabase.getProductNameByCode(productCode);
+  if (!cachedName) {
+    console.error(
+      `add_to_cart failed for ${productCode}; no cached name → cannot fall back. Original error: ${first.message}`,
+    );
+    return first;
+  }
+
+  console.error(
+    `add_to_cart failed for ${productCode} (cached as "${cachedName}"); marking stale and re-searching…`,
+  );
+  willysDatabase.markProductStale(productCode);
+
+  const search = await mcpSearchProducts(sessionId, cachedName, 0, 5);
+  if (!search.success || !search.products || search.products.length === 0) {
+    return {
+      success: false,
+      message: `Original code ${productCode} is no longer valid and re-search for "${cachedName}" returned nothing.`,
+    };
+  }
+
+  const top = search.products[0];
+  if (top.code === productCode) {
+    // Fresh search returned the same dead code — the original failure
+    // probably wasn't about staleness (maybe out of stock, auth glitch, etc.).
+    // Revert the stale marker so we don't silently hide a real product.
+    console.error(
+      `Re-search returned same code ${productCode}; clearing stale marker (failure was probably transient).`,
+    );
+    willysDatabase.cacheProductsFromSearch([
+      { code: top.code, name: top.name, manufacturer: top.manufacturer },
+    ]);
+    return {
+      success: false,
+      message: `Add to cart failed for ${productCode} — re-search returned the same code, so the issue is likely transient (auth / stock). Original error: ${first.message}`,
+    };
+  }
+
+  const retry = await addToCartRaw(sessionId, top.code, quantity);
+  if (retry.success) {
+    try {
+      willysDatabase.logCartAddition(top.code, top.name);
+    } catch (e) {
+      console.error("logCartAddition (substituted) failed:", e);
+    }
+    return {
+      success: true,
+      message: `Original code ${productCode} was stale — substituted "${top.name}" [${top.code}] instead.`,
+    };
+  }
+  return {
+    success: false,
+    message: `Original code ${productCode} stale; retried with "${top.name}" [${top.code}] but that also failed: ${retry.message}`,
+  };
+}
+
 export async function mcpRemoveFromCart(
   sessionId: string,
   productCode: string,
 ): Promise<{ success: boolean; message?: string }> {
   try {
-    const cookies = await mcpGetWillysCookies(sessionId);
-    if (!cookies) {
-      throw new Error("No authentication cookies found");
-    }
-
-    const csrfToken = await fetchCsrfToken(cookies);
-    console.log("Retrieved CSRF token:", truncateForLog(csrfToken));
-
-    const response = await fetchWithRetry(
-      "https://www.willys.se/axfood/rest/cart/addProducts",
-      {
-        method: "POST",
-        headers: getApiHeaders(cookies, csrfToken),
-        body: JSON.stringify({
-          products: [
-            {
-              productCodePost: productCode,
-              qty: 0,
-              pickUnit: "pieces",
-              hideDiscountToolTip: false,
-              noReplacementFlag: false,
-            },
-          ],
-        }),
-      },
-    );
+    const response = await withAuthRefresh(sessionId, async (cookies) => {
+      const csrfToken = await fetchCsrfToken(cookies);
+      console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
+      return fetchWithRetry(
+        "https://www.willys.se/axfood/rest/cart/addProducts",
+        {
+          method: "POST",
+          headers: getApiHeaders(cookies, csrfToken),
+          body: JSON.stringify({
+            products: [
+              {
+                productCodePost: productCode,
+                qty: 0,
+                pickUnit: "pieces",
+                hideDiscountToolTip: false,
+                noReplacementFlag: false,
+              },
+            ],
+          }),
+        },
+      );
+    });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -599,23 +738,19 @@ export async function mcpSelectSlot(
   isTmsSlot: boolean = false,
 ): Promise<{ success: boolean; message?: string }> {
   try {
-    const cookies = await mcpGetWillysCookies(sessionId);
-    if (!cookies) {
-      throw new Error("No authentication cookies found");
-    }
-
-    const csrfToken = await fetchCsrfToken(cookies);
-
     const url = isTmsSlot
       ? "https://www.willys.se/axfood/rest/tms/select-slot"
       : "https://www.willys.se/axfood/rest/select-pickup-slot";
 
     const body = isTmsSlot ? { slotCode, tmsData: {} } : { slotCode };
 
-    const response = await fetchWithRetry(url, {
-      method: "POST",
-      headers: getApiHeaders(cookies, csrfToken),
-      body: JSON.stringify(body),
+    const response = await withAuthRefresh(sessionId, async (cookies) => {
+      const csrfToken = await fetchCsrfToken(cookies);
+      return fetchWithRetry(url, {
+        method: "POST",
+        headers: getApiHeaders(cookies, csrfToken),
+        body: JSON.stringify(body),
+      });
     });
 
     if (!response.ok) {
@@ -639,25 +774,21 @@ export async function mcpCheckout(
   sessionId: string,
 ): Promise<{ success: boolean; message?: string; emptyCart?: boolean }> {
   try {
-    const cookies = await mcpGetWillysCookies(sessionId);
-    if (!cookies) {
-      throw new Error("No authentication cookies found");
-    }
-
-    const tracking = generateTrackingHeaders();
-
-    const response = await fetchWithRetry(
-      "https://www.willys.se/axfood/rest/checkout",
-      {
-        method: "GET",
-        headers: {
-          ...getApiHeaders(cookies),
-          accept: "application/json, text/plain, */*",
-          "x-newrelic-id": "VQcCVVdaDhAHUFFTDwQAVFc=",
-          "x-request-id": tracking.traceparent.split("-")[1],
+    const response = await withAuthRefresh(sessionId, async (cookies) => {
+      const tracking = generateTrackingHeaders();
+      return fetchWithRetry(
+        "https://www.willys.se/axfood/rest/checkout",
+        {
+          method: "GET",
+          headers: {
+            ...getApiHeaders(cookies),
+            accept: "application/json, text/plain, */*",
+            "x-newrelic-id": "VQcCVVdaDhAHUFFTDwQAVFc=",
+            "x-request-id": tracking.traceparent.split("-")[1],
+          },
         },
-      },
-    );
+      );
+    });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -687,7 +818,7 @@ export async function mcpGetOffers(sessionId: string) {
       throw new Error("No authentication cookies found");
     }
 
-    console.log(
+    console.error(
       "Using MCP cookies for offers request:",
       truncateForLog(cookies, 100),
     );
@@ -708,7 +839,7 @@ export async function mcpGetOffers(sessionId: string) {
     }
 
     const data: unknown = await response.json();
-    console.log(
+    console.error(
       "Offers API response received, data keys:",
       Object.keys(data as Record<string, unknown>),
     );
@@ -767,7 +898,7 @@ export async function mcpSearchProducts(
     }
 
     const htmlData = await response.text();
-    console.log(
+    console.error(
       `Search results received for query "${query}": ${htmlData.length} characters of HTML`,
     );
 
@@ -821,6 +952,30 @@ export async function mcpSearchProducts(
       console.error("Failed to parse search results JSON:", parseError);
     }
 
+    // Fix 3: cache the results so future smart-match / hybrid searches can
+    // serve them without an API call, and so add_to_cart's stale-code retry
+    // path has a name to re-search by. Best-effort; never blocks the response.
+    if (products.length > 0) {
+      try {
+        const { willysDatabase } = await import("./database");
+        const { inserted, revived } = willysDatabase.cacheProductsFromSearch(
+          products.map((p) => ({
+            code: p.code,
+            name: p.name,
+            manufacturer: p.manufacturer,
+            category: p.categoryName,
+          })),
+        );
+        if (inserted > 0 || revived > 0) {
+          console.error(
+            `Cached search results for "${query}": ${inserted} new, ${revived} revived from stale`,
+          );
+        }
+      } catch (cacheError) {
+        console.error("Failed to cache search results:", cacheError);
+      }
+    }
+
     return {
       success: true,
       query,
@@ -859,7 +1014,7 @@ export async function mcpGetSearchSuggestions(sessionId: string, term: string) {
     }
 
     const data: unknown = await response.json();
-    console.log(
+    console.error(
       `Search suggestions received for term "${term}":`,
       JSON.stringify(data, null, 2),
     );
@@ -885,7 +1040,7 @@ export async function mcpGetCommonProducts(sessionId: string) {
       throw new Error("No authentication cookies found");
     }
 
-    console.log(
+    console.error(
       "Using MCP cookies for common products request:",
       truncateForLog(cookies, 100),
     );
@@ -904,7 +1059,7 @@ export async function mcpGetCommonProducts(sessionId: string) {
     }
 
     const data: unknown = await response.json();
-    console.log(
+    console.error(
       "Common products API response received, data keys:",
       Object.keys(data as Record<string, unknown>),
     );
@@ -920,6 +1075,56 @@ export async function mcpGetCommonProducts(sessionId: string) {
       message: getErrorMessage(error),
     };
   }
+}
+
+// Pull a useful description blob out of the raw Next.js data dump returned
+// by mcpGetProductDetail. The exact shape is unstable; walk a few common
+// paths and concatenate whatever we find. Order matters: marketing copy
+// first, then ingredients (often where the differentiating word lives).
+export function extractProductDescription(raw: unknown): string {
+  if (!raw || typeof raw !== "object") return "";
+  const out: string[] = [];
+  const visit = (node: any, depth = 0): void => {
+    if (!node || depth > 8) return;
+    if (typeof node === "string") return;
+    if (Array.isArray(node)) {
+      for (const x of node) visit(x, depth + 1);
+      return;
+    }
+    if (typeof node !== "object") return;
+    for (const [key, val] of Object.entries(node)) {
+      const k = key.toLowerCase();
+      if (typeof val === "string" && val.trim().length > 3) {
+        if (
+          k.includes("description") ||
+          k.includes("ingredient") ||
+          k.includes("ingredienser") ||
+          k.includes("productinformation") ||
+          k.includes("produktinformation") ||
+          k.includes("summary") ||
+          k.includes("marketing") ||
+          k === "longdescription" ||
+          k === "shortdescription"
+        ) {
+          out.push(val.trim());
+        }
+      } else if (val && typeof val === "object") {
+        visit(val, depth + 1);
+      }
+    }
+  };
+  visit(raw);
+  // Dedupe; collapse whitespace.
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const s of out) {
+    const norm = s.replace(/\s+/g, " ").trim();
+    if (norm && !seen.has(norm)) {
+      seen.add(norm);
+      cleaned.push(norm);
+    }
+  }
+  return cleaned.join(" \n ");
 }
 
 export async function mcpGetProductDetail(
@@ -941,7 +1146,7 @@ export async function mcpGetProductDetail(
     const name = productName || `product-${productCode}`;
     const url = `https://www.willys.se/_next/data/${buildId}/sv/produktdetalj/${name}.json?name=${encodeURIComponent(name)}&productCode=${encodeURIComponent(productCode)}&showInModal=true`;
 
-    console.log("Fetching product detail from:", url);
+    console.error("Fetching product detail from:", url);
 
     const response = await fetchWithRetry(url, {
       headers: {
@@ -956,7 +1161,7 @@ export async function mcpGetProductDetail(
     }
 
     const data: unknown = await response.json();
-    console.log("Product detail API response received");
+    console.error("Product detail API response received");
 
     return {
       success: true,
@@ -994,7 +1199,7 @@ export async function mcpGetSmartProductMatches(
   maxResults: number = 5,
 ) {
   try {
-    console.log(`Finding smart product matches for: "${searchTerm}"`);
+    console.error(`Finding smart product matches for: "${searchTerm}"`);
 
     // Use hybrid search (combines SQL text search with vector similarity)
     const { willysDatabase } = await import("./database");
@@ -1003,12 +1208,12 @@ export async function mcpGetSmartProductMatches(
       maxResults,
     );
 
-    console.log(
+    console.error(
       `Found ${hybridResults.length} hybrid search matches (text + vector)`,
     );
 
     if (hybridResults.length === 0) {
-      console.log("No matches found, falling back to regular search");
+      console.error("No matches found, falling back to regular search");
       const searchResult = await mcpSearchProducts(
         sessionId,
         searchTerm,

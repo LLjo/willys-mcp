@@ -23,7 +23,7 @@ class McpSessionStore {
   storeSession(sessionId: string, cookies: string): void {
     try {
       willysDatabase.storeSession(sessionId, cookies, this.SESSION_TIMEOUT);
-      console.log(`Session ${sessionId} stored in database`);
+      console.error(`Session ${sessionId} stored in database`);
     } catch (error) {
       console.error(`Error storing session ${sessionId}:`, error);
       throw error;
@@ -54,7 +54,7 @@ class McpSessionStore {
       // Clear the session (this will also cascade delete order cache entries)
       willysDatabase.clearSession(sessionId);
 
-      console.log(`Session ${sessionId} cleared from database`);
+      console.error(`Session ${sessionId} cleared from database`);
     } catch (error) {
       console.error(`Error clearing session ${sessionId}:`, error);
     }

@@ -12,7 +12,7 @@ export async function mcpAuthenticateWithWillys(
   credentials: WillysCredentials,
 ): Promise<AuthResult & { sessionId?: string }> {
   try {
-    console.log("Starting MCP Puppeteer authentication...");
+    console.error("Starting MCP Puppeteer authentication...");
 
     // Use dynamic import for Puppeteer to avoid issues
     const { loginWithPuppeteer } = await import("@/lib/puppeteer-auth");
@@ -22,7 +22,7 @@ export async function mcpAuthenticateWithWillys(
       credentials.password,
     );
 
-    console.log("Puppeteer login successful, storing in MCP session...");
+    console.error("Puppeteer login successful, storing in MCP session...");
 
     // Convert cookies object to string format
     const cookieString = Object.entries(sessionCookies)
@@ -32,7 +32,7 @@ export async function mcpAuthenticateWithWillys(
     // Store in MCP session store
     mcpSessionStore.storeSession(sessionId, cookieString);
 
-    console.log("MCP authentication completed successfully");
+    console.error("MCP authentication completed successfully");
     return { success: true, sessionId };
   } catch (error) {
     console.error("MCP Puppeteer authentication error:", error);
@@ -56,13 +56,13 @@ export async function mcpLogout(sessionId: string): Promise<void> {
 export async function mcpGetWillysCookies(sessionId: string): Promise<string> {
   const session = mcpSessionStore.getSession(sessionId);
   if (!session) {
-    console.log("No MCP session found for ID:", sessionId);
+    console.error("No MCP session found for ID:", sessionId);
     return "";
   }
 
-  console.log("Found MCP session cookies for ID:", sessionId);
-  console.log("Cookie string length:", session.cookies.length);
-  console.log(
+  console.error("Found MCP session cookies for ID:", sessionId);
+  console.error("Cookie string length:", session.cookies.length);
+  console.error(
     "Cookie string preview:",
     `${session.cookies.substring(0, 100)}...`,
   );

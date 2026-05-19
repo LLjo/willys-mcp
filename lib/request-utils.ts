@@ -124,7 +124,7 @@ export async function fetchWithRetry(
 
         if (attempt < maxRetries) {
           const delay = calculateBackoffDelay(attempt, baseDelayMs);
-          console.log(
+          console.error(
             `Retrying request to ${url} after ${Math.round(delay)}ms (attempt ${attempt + 1}/${maxRetries + 1}, status: ${response.status})`,
           );
           await sleep(delay);
@@ -149,7 +149,7 @@ export async function fetchWithRetry(
       // Only retry on retryable errors
       if (isRetryableError(lastError) && attempt < maxRetries) {
         const delay = calculateBackoffDelay(attempt, baseDelayMs);
-        console.log(
+        console.error(
           `Retrying request to ${url} after ${Math.round(delay)}ms (attempt ${attempt + 1}/${maxRetries + 1}, error: ${lastError.message})`,
         );
         await sleep(delay);
