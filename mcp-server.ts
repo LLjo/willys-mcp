@@ -14,6 +14,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readCredentialsFile } from "./lib/credentials";
 import { willysDatabase } from "./lib/database";
+import { getLoginState } from "./lib/login-state";
 import {
   generatePassageEmbeddingsBatch,
   generateQueryEmbedding,
@@ -45,6 +46,7 @@ import {
   mcpRemoveFromCart,
   mcpSearchProducts,
   mcpSelectSlot,
+  performReauth,
 } from "./lib/mcp-orders";
 import {
   formatAliases,
@@ -78,19 +80,6 @@ const server = new Server(
 // Define all tools
 const tools = [
   {
-    name: "mcp__willys_login",
-    description:
-      "Manually log in to Willys with a username and password. NOT normally needed — the server auto-logs in from a credentials file at startup, and all other tools work without any extra setup. Only call this to switch accounts or re-authenticate after a failure.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        username: { type: "string", description: "Willys username/email" },
-        password: { type: "string", description: "Willys password" },
-      },
-      required: ["username", "password"],
-    },
-  },
-  {
     name: "mcp__willys_logout",
     description:
       "Clear the active Willys authentication session. Rarely needed — auto-login restores it on next request.",
@@ -111,6 +100,18 @@ const tools = [
       },
       required: [],
     },
+  },
+  {
+    name: "mcp__willys_login_status",
+    description:
+      "Return the current re-authentication state (idle / logging_in / logged_in / failed), what action triggered it, and how long the last login took. Useful when the user asks 'are you still working?' / 'what's happening?', or when a previous tool's response mentioned a re-auth and you want to confirm. Cheap, non-side-effecting.",
+    inputSchema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "mcp__willys_reauth",
+    description:
+      "Start a fresh Willys login in the background using the stored credentials file. Returns IMMEDIATELY (within a fraction of a second) — does NOT wait for the login to finish. Takes no arguments. Use this ONLY when another tool's response told you 'session expired — call mcp__willys_reauth and retry'. Flow: (1) tell the user 'Logging back in to Willys…' (2) call this tool (3) it returns instantly with '✅ Login started' (4) re-call the original tool with the same arguments — that tool will transparently wait for the login to finish (~10–20s) and then complete. Internally mutex'd so concurrent reauth requests share a single Puppeteer login.",
+    inputSchema: { type: "object" as const, properties: {} },
   },
   {
     name: "mcp__willys_get_orders",
@@ -151,7 +152,7 @@ const tools = [
   {
     name: "mcp__willys_add_to_cart",
     description:
-      "Add a product to the shopping cart by EXACT product code. WARNING: do not call this immediately after mcp__willys_search — Willys's search returns many imperfect matches and auto-adding the first one is usually wrong. For 'add X to cart' requests use mcp__willys_preferred_add (the one-shot tool that resolves intent against the user's preferred list). Only call this directly when (a) the user has just confirmed a numbered choice from a search result, or (b) you are 100% sure of the product code.",
+      "Add a product to the shopping cart by EXACT product code. WARNING: do not call this immediately after mcp__willys_search — Willys's search returns many imperfect matches and auto-adding the first one is usually wrong. For 'add X to cart' requests use mcp__willys_preferred_add (the one-shot tool that resolves intent against the user's preferred list). Only call this directly when (a) the user has just confirmed a numbered choice from a search result, or (b) you are 100% sure of the product code. If the response includes a re-auth note (e.g. '(Willys session had expired — re-authenticated in 9s)'), TELL THE USER about it in your reply — that's why the action took longer than usual.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -447,51 +448,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Handle tool calls
+/**
+ * When an action tool returns `needsAuth: true`, render a structured message
+ * that walks the LLM through the LLM-orchestrated reauth flow: tell the
+ * user it's logging in, call mcp__willys_reauth, then re-invoke the tool
+ * with the original args. The LLM gets to speak between each step, so the
+ * user hears mid-flow progress instead of staring at a silent 10s pause.
+ */
+function needsAuthResponse(
+  toolName: string,
+  originalArgs: unknown,
+  actionDescription: string | undefined,
+) {
+  const argsJson = JSON.stringify(originalArgs ?? {});
+  const text = [
+    `⚠️ Willys session has expired — re-authentication required before retrying ${actionDescription ?? toolName}.`,
+    ``,
+    `Please follow these steps EXACTLY in order, narrating each one to the user:`,
+    `  1. SAY: "Logging back in to Willys, this'll take about 15 seconds…"`,
+    `  2. CALL: mcp__willys_reauth (no arguments) — returns instantly`,
+    `  3. CALL: ${toolName} with the same arguments: ${argsJson} — this call will wait for the login to finish and then complete the action`,
+    `  4. When step 3 returns successfully, tell the user what was done (e.g. "Added to cart.").`,
+    ``,
+    `Do NOT call mcp__willys_reauth a second time, do NOT call mcp__willys_login_status — just call ${toolName} once after reauth and wait for it. Do not skip the narration in step 1 — the user is waiting and needs to know what's happening.`,
+  ].join("\n");
+  return { content: [{ type: "text" as const, text }] };
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  // Tool-call telemetry. Redact password on login; keep everything else
-  // visible so we can diagnose hallucinated tool calls vs. real failures.
-  // stderr only (stdout is reserved for JSON-RPC).
-  const redacted = (name === "mcp__willys_login" && args)
-    ? { ...args, password: "***" }
-    : args;
+  // Tool-call telemetry — stderr only (stdout is reserved for JSON-RPC).
   const callT0 = Date.now();
-  console.error(`[mcp-call] ${name} args=${JSON.stringify(redacted)}`);
+  console.error(`[mcp-call] ${name} args=${JSON.stringify(args)}`);
 
   try {
     switch (name) {
-      case "mcp__willys_login": {
-        const { username, password } = args as {
-          username: string;
-          password: string;
-        };
-        const sessionId = mcpSessionStore.generateSessionId();
-        const result = await mcpAuthenticateWithWillys(sessionId, {
-          username,
-          password,
-        });
-
-        if (result.success) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `✅ Successfully logged in. The session is now active and used automatically by all other tools — no further action needed.`,
-              },
-            ],
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ Login failed: ${result.error || "Invalid credentials"}`,
-            },
-          ],
-        };
-      }
-
       case "mcp__willys_logout": {
         const { sessionId = DEFAULT_SESSION_ID } = args as { sessionId?: string };
         await mcpLogout(sessionId);
@@ -511,6 +503,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case "mcp__willys_reauth": {
+        const { sessionId = DEFAULT_SESSION_ID } = args as {
+          sessionId?: string;
+        };
+        // Fire-and-forget the Puppeteer login. We don't await — instead we
+        // return immediately so the LLM client doesn't hit its tool-call
+        // timeout (~10s) while Puppeteer takes 15–22s to log in. The
+        // action tool the LLM retries next will block on awaitInflightLogin
+        // and pick up the fresh cookies once login completes. The mutex in
+        // runLoginOnce dedupes concurrent reauth calls.
+        performReauth(sessionId, "manual reauth via tool call").catch((err) => {
+          console.error(
+            `[reauth] background login threw: ${err instanceof Error ? err.message : err}`,
+          );
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ Login started in the background. Now re-call the original tool with the same arguments — it will wait for the login to finish (~10–20s) and then succeed.`,
+            },
+          ],
+        };
+      }
+
+      case "mcp__willys_login_status": {
+        const s = getLoginState();
+        // Human-friendly summary for the LLM to relay verbatim.
+        const lines: string[] = [`Status: ${s.status}`];
+        if (s.pendingAction) lines.push(`Pending action: ${s.pendingAction}`);
+        if (s.status === "logging_in" && s.startedAt) {
+          const elapsed = ((Date.now() - s.startedAt) / 1000).toFixed(1);
+          lines.push(`Logging in now — ${elapsed}s elapsed.`);
+        }
+        if (s.lastDurationMs !== null && s.status !== "logging_in") {
+          lines.push(
+            `Last login took ${(s.lastDurationMs / 1000).toFixed(1)}s.`,
+          );
+        }
+        if (s.lastError) lines.push(`Last error: ${s.lastError}`);
+        lines.push(
+          `Lifetime: ${s.successCount} successful re-auths, ${s.failureCount} failed.`,
+        );
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
       case "mcp__willys_get_orders": {
@@ -574,6 +612,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           quantity?: number;
         };
         const result = await mcpAddToCart(sessionId, productCode, quantity);
+        if (result.needsAuth) {
+          return needsAuthResponse(
+            name,
+            { productCode, quantity },
+            result.actionDescription,
+          );
+        }
         return {
           content: [
             {
@@ -592,6 +637,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           productCode: string;
         };
         const result = await mcpRemoveFromCart(sessionId, productCode);
+        if (result.needsAuth) {
+          return needsAuthResponse(name, { productCode }, result.actionDescription);
+        }
         return {
           content: [
             {
@@ -607,6 +655,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "mcp__willys_checkout": {
         const { sessionId = DEFAULT_SESSION_ID } = args as { sessionId?: string };
         const result = await mcpCheckout(sessionId);
+        if (result.needsAuth) {
+          return needsAuthResponse(name, {}, result.actionDescription);
+        }
         return {
           content: [
             {
@@ -692,6 +743,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           isTmsSlot?: boolean;
         };
         const result = await mcpSelectSlot(sessionId, slotCode, isTmsSlot);
+        if (result.needsAuth) {
+          return needsAuthResponse(
+            name,
+            { slotCode, isTmsSlot },
+            result.actionDescription,
+          );
+        }
         return {
           content: [
             {
@@ -1084,6 +1142,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // previous multi-match. Skip resolution and add directly.
         if (productCode) {
           const result = await mcpAddToCart(sessionId, productCode, quantity);
+          if (result.needsAuth) {
+            return needsAuthResponse(
+              name,
+              { query, quantity, productCode },
+              result.actionDescription,
+            );
+          }
           const cachedName =
             willysDatabase.getProductNameByCode(productCode) || productCode;
           return {
@@ -1247,6 +1312,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             `[preferred_add] "${query}" → AUTO-ADD ${m.name} [${m.productCode}] (${m.matchedBy})`,
           );
           const result = await mcpAddToCart(sessionId, m.productCode, quantity);
+          if (result.needsAuth) {
+            return needsAuthResponse(
+              name,
+              { query, quantity },
+              result.actionDescription,
+            );
+          }
           return {
             content: [
               {
@@ -1270,8 +1342,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const lead = isFromWillysFallback
           ? `❓ Found preferred match(es) for "${query}" via live Willys search — confirm with the user which one before adding. Then call mcp__willys_preferred_add again with the chosen productCode:`
           : `❓ Multiple preferred matches for "${query}" — ask the user which one, then call mcp__willys_preferred_add again with the chosen productCode:`;
+        const codeHint =
+          "(Read names aloud to the user; never speak or write the [bracketed] codes. Pass the chosen code as productCode in the follow-up call.)";
         return {
-          content: [{ type: "text", text: `${lead}\n${lines.join("\n")}` }],
+          content: [
+            { type: "text", text: `${lead}\n${lines.join("\n")}\n${codeHint}` },
+          ],
         };
       }
 
@@ -1341,7 +1417,7 @@ async function autoLoginIfConfigured(): Promise<void> {
   const creds = readCredentialsFile();
   if (!creds) {
     console.error(
-      "No .credentials file found; skipping auto-login. Use mcp__willys_login.",
+      "No .credentials file found; skipping auto-login. Add credentials and restart the container.",
     );
     return;
   }
@@ -1540,7 +1616,8 @@ async function main() {
 
   // Try to pre-authenticate using .credentials so callers can omit sessionId
   await autoLoginIfConfigured();
-  scheduleProactiveRefresh();
+  // Proactive 4h refresh disabled: Willys session lives ~1h, so the timer
+  // fires too late to matter — the LLM-orchestrated reauth on 401 covers it.
 
   // Fire-and-forget the order-history backfill. We don't await it because it
   // can take minutes (50 orders × ~500 ms + HTTP) and there's no reason to

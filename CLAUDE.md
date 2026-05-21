@@ -96,6 +96,15 @@ Enrichment hooks (in `mcp-server.ts`):
 - **Auto-login at startup** in `mcp-server.ts`. `autoLoginIfConfigured()` reads `.credentials` (line 1 = email, line 2 = password; path overridable via `WILLYS_CREDENTIALS_PATH` env var) and pre-authenticates using a fixed `DEFAULT_SESSION_ID = "default"`.
 - **`sessionId` removed from every non-auth tool's `inputSchema`** (was in `properties`, now stripped). All handlers default `sessionId` to `DEFAULT_SESSION_ID` when not provided. This is essential: with `sessionId` visible in the schema, LLMs refuse to call the tools ("I don't have a sessionId").
 - The `mcp__willys_login` tool still exists but its description now says it's not normally needed.
+- **LLM-orchestrated re-auth** (`lib/login-state.ts` + `withAuthRefresh` in `lib/mcp-orders.ts`). The flow:
+  - When an API call returns 401/403/CSRF mid-conversation, `withAuthRefresh` THROWS `WillysAuthRequiredError(actionDescription, upstreamStatus)` instead of silently re-logging in.
+  - Each action-tool wrapper (`mcpAddToCart`, `mcpRemoveFromCart`, `mcpSelectSlot`, `mcpCheckout`) catches the error and returns `{ success: false, needsAuth: true, actionDescription }`.
+  - The corresponding MCP handler in `mcp-server.ts` sees `needsAuth: true` and replies via `needsAuthResponse(toolName, originalArgs, actionDescription)`, which renders an instruction message telling the LLM exactly what to do: (1) tell the user it's logging in, (2) call `mcp__willys_reauth`, (3) tell the user it's logged in, (4) re-call the original tool with the same args.
+  - Why: MCP tool calls are synchronous, so the silent auto-retry path would leave the user staring at a 10s+ pause. The LLM-orchestrated path lets the model speak between steps, giving real-time progress.
+  - `performReauth(sessionId, actionDescription)` is the programmatic entry point and runs through the `runLoginOnce` mutex — concurrent reauth calls share a single Puppeteer login.
+  - `getLoginState()` (`idle` / `logging_in` / `logged_in` / `failed`) exposes the state. `mcp__willys_login_status` is a tool the LLM can call when the user asks "what's happening?" / "are you still working?".
+  - `mcp__willys_reauth` is the no-args tool that uses `.credentials` to re-login. Returns `"✅ Re-authenticated in Xs"` or `"❌ Re-auth FAILED after Xs"`.
+  - Read-only tools (`mcpGetCart`, `mcpGetOrders` etc.) don't currently use `withAuthRefresh` and will fail with raw errors if the session is dead. That's acceptable — the LLM sees the error and can call `mcp__willys_reauth` then retry. Wire them up the same way if it becomes annoying.
 
 ### Response formatting (`lib/mcp-formatters.ts`)
 - New file containing voice-friendly formatters for every chatty tool (`formatSearchResults`, `formatCart`, `formatOrders`, `formatDeliverySlots`, etc.). They emit concise prose with product codes tucked into a single `[codes: ...]` line at the end.

@@ -48,6 +48,14 @@ function withCodeIndex(
   return `${lines.join("\n")}\n[codes: ${codes.join(", ")}]`;
 }
 
+// One-line reminder appended to disambiguation responses. The system prompt
+// already tells the agent not to speak [bracketed] content, but the
+// "list-to-user then silently pass code in follow-up tool call" flow is the
+// place it's most likely to slip — so we restate it inline, scoped to where
+// it matters.
+const CODE_HANDLING_HINT =
+  "(Read names aloud to the user; never speak or write the [bracketed] codes. Pass the chosen code as productCode in the follow-up tool call.)";
+
 export function formatSearchResults(
   query: string,
   products: AnyObj[] | undefined,
@@ -67,13 +75,13 @@ export function formatSearchResults(
     products.length > top.length
       ? `\n…and ${products.length - top.length} more.`
       : "";
-  return withCodeIndex(
+  return `${withCodeIndex(
     [`Top ${top.length} results for "${query}":`, ...lines, more].filter(
       Boolean,
     ),
     top,
     pickName,
-  );
+  )}\n${CODE_HANDLING_HINT}`;
 }
 
 export function formatSearchSuggestions(

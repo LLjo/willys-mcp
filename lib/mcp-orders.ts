@@ -48,48 +48,91 @@ function isCsrfOrAuthFailure(status: number, body: string): boolean {
   return false;
 }
 
-async function refreshSession(sessionId: string): Promise<boolean> {
-  const creds = readCredentialsFile();
-  if (!creds) {
-    console.error("Auto-reauth skipped: no .credentials file available");
-    return false;
+import { awaitInflightLogin, runLoginOnce } from "./login-state";
+
+/**
+ * Thrown by withAuthRefresh when the Willys session is dead and a re-auth
+ * is required. Handlers catch this and return a structured "please call
+ * mcp__willys_reauth and retry" response so the LLM can narrate the
+ * recovery flow to the user (mid-flow feedback that the silent auto-reauth
+ * path couldn't provide).
+ *
+ * Carries the original action description so the surrounding handler can
+ * tell the LLM exactly what to retry.
+ */
+export class WillysAuthRequiredError extends Error {
+  readonly actionDescription: string;
+  readonly upstreamStatus: number | null;
+  constructor(actionDescription: string, upstreamStatus: number | null) {
+    super(
+      `Willys re-auth required for "${actionDescription}" (upstream status ${upstreamStatus ?? "?"})`,
+    );
+    this.name = "WillysAuthRequiredError";
+    this.actionDescription = actionDescription;
+    this.upstreamStatus = upstreamStatus;
   }
-  const result = await mcpAuthenticateWithWillys(sessionId, creds);
-  if (result.success) {
-    console.error(`Auto-reauth succeeded for session ${sessionId}`);
-    return true;
-  }
-  console.error(`Auto-reauth failed: ${result.error ?? "unknown error"}`);
-  return false;
 }
 
-// Run a request that needs a valid session; on CSRF/401 failure, refresh the
-// Willys session via Puppeteer login and retry the request once.
+// Programmatic helper for the new `mcp__willys_reauth` tool. Runs through
+// the runLoginOnce mutex so concurrent tool calls share a single Puppeteer
+// login instead of racing.
+export async function performReauth(
+  sessionId: string,
+  actionDescription: string = "manual reauth",
+): Promise<{ success: boolean; durationMs: number; error?: string }> {
+  const creds = readCredentialsFile();
+  if (!creds) {
+    return {
+      success: false,
+      durationMs: 0,
+      error: "no .credentials file available",
+    };
+  }
+  const t0 = Date.now();
+  const success = await runLoginOnce(actionDescription, async () => {
+    const result = await mcpAuthenticateWithWillys(sessionId, creds);
+    return { success: result.success, error: result.error };
+  });
+  return { success, durationMs: Date.now() - t0 };
+}
+
+// Run a request that needs a valid session. On CSRF/401 failure, we now
+// THROW WillysAuthRequiredError instead of silently re-logging in — see the
+// class doc for why. Handlers convert the throw into a structured response
+// that tells the LLM to call mcp__willys_reauth then retry the original
+// tool. The LLM speaks between those tool calls, so the user hears mid-flow
+// status ("Re-authenticating…" → "Logged in, adding the milk…" → "Done.").
+//
+// `actionDescription` is forwarded into the thrown error so handlers can
+// quote it back to the LLM with the exact retry args.
 async function withAuthRefresh(
   sessionId: string,
   request: (cookies: string) => Promise<Response>,
-): Promise<Response> {
-  let cookies = await mcpGetWillysCookies(sessionId);
-  if (!cookies) throw new Error("No authentication cookies found");
+  actionDescription: string = "unspecified Willys API call",
+): Promise<{ response: Response }> {
+  // If a re-login is currently in flight (e.g. the LLM just called
+  // mcp__willys_reauth and immediately fired this retry), wait for it
+  // to finish so we pick up the fresh cookies. Otherwise we'd race
+  // against the in-flight Puppeteer login and hit 401 again. No-op if
+  // no login is in flight.
+  await awaitInflightLogin();
+
+  const cookies = await mcpGetWillysCookies(sessionId);
+  if (!cookies) {
+    throw new WillysAuthRequiredError(actionDescription, null);
+  }
 
   const response = await request(cookies);
-  if (response.ok) return response;
-  if (response.status !== 401 && response.status !== 403) return response;
+  if (response.ok) return { response };
+  if (response.status !== 401 && response.status !== 403) return { response };
 
   const body = await response.clone().text();
-  if (!isCsrfOrAuthFailure(response.status, body)) return response;
+  if (!isCsrfOrAuthFailure(response.status, body)) return { response };
 
   console.error(
-    `Auth/CSRF failure (status ${response.status}): ${truncateForLog(body, 80)} — refreshing session...`,
+    `[withAuthRefresh] Auth/CSRF failure during "${actionDescription}" (status ${response.status}): ${truncateForLog(body, 80)} — throwing for LLM-orchestrated reauth`,
   );
-  const refreshed = await refreshSession(sessionId);
-  if (!refreshed) return response;
-
-  cookies = await mcpGetWillysCookies(sessionId);
-  if (!cookies) return response;
-
-  console.error("Retrying request after session refresh");
-  return request(cookies);
+  throw new WillysAuthRequiredError(actionDescription, response.status);
 }
 
 function parseCurrencyToNumber(value: unknown): number {
@@ -405,30 +448,39 @@ async function addToCartRaw(
   sessionId: string,
   productCode: string,
   quantity: number,
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{
+  success: boolean;
+  message?: string;
+  needsAuth?: boolean;
+  actionDescription?: string;
+}> {
   try {
-    const response = await withAuthRefresh(sessionId, async (cookies) => {
-      const csrfToken = await fetchCsrfToken(cookies);
-      console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
-      return fetchWithRetry(
-        "https://www.willys.se/axfood/rest/cart/addProducts",
-        {
-          method: "POST",
-          headers: getApiHeaders(cookies, csrfToken),
-          body: JSON.stringify({
-            products: [
-              {
-                productCodePost: productCode,
-                qty: quantity,
-                pickUnit: "pieces",
-                hideDiscountToolTip: false,
-                noReplacementFlag: false,
-              },
-            ],
-          }),
-        },
-      );
-    });
+    const { response } = await withAuthRefresh(
+      sessionId,
+      async (cookies) => {
+        const csrfToken = await fetchCsrfToken(cookies);
+        console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
+        return fetchWithRetry(
+          "https://www.willys.se/axfood/rest/cart/addProducts",
+          {
+            method: "POST",
+            headers: getApiHeaders(cookies, csrfToken),
+            body: JSON.stringify({
+              products: [
+                {
+                  productCodePost: productCode,
+                  qty: quantity,
+                  pickUnit: "pieces",
+                  hideDiscountToolTip: false,
+                  noReplacementFlag: false,
+                },
+              ],
+            }),
+          },
+        );
+      },
+      `add_to_cart productCode=${productCode} qty=${quantity}`,
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -439,6 +491,14 @@ async function addToCartRaw(
 
     return { success: true };
   } catch (error) {
+    if (error instanceof WillysAuthRequiredError) {
+      return {
+        success: false,
+        needsAuth: true,
+        actionDescription: error.actionDescription,
+        message: error.message,
+      };
+    }
     console.error("Error adding to MCP cart:", error);
     return {
       success: false,
@@ -452,7 +512,12 @@ export async function mcpAddToCart(
   productCode: string,
   quantity: number = 1,
   options: { allowFallback?: boolean } = {},
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{
+  success: boolean;
+  message?: string;
+  needsAuth?: boolean;
+  actionDescription?: string;
+}> {
   const allowFallback = options.allowFallback !== false;
 
   // First attempt with whatever code we were given.
@@ -465,8 +530,11 @@ export async function mcpAddToCart(
     } catch (e) {
       console.error("logCartAddition failed:", e);
     }
-    return first;
+    return { success: true };
   }
+
+  // Auth failure → bubble up so handler can return LLM-orchestrated reauth instructions.
+  if (first.needsAuth) return first;
   if (!allowFallback) return first;
 
   // Fix 3: the code came back invalid. If we have a cached name for it,
@@ -534,30 +602,39 @@ export async function mcpAddToCart(
 export async function mcpRemoveFromCart(
   sessionId: string,
   productCode: string,
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{
+  success: boolean;
+  message?: string;
+  needsAuth?: boolean;
+  actionDescription?: string;
+}> {
   try {
-    const response = await withAuthRefresh(sessionId, async (cookies) => {
-      const csrfToken = await fetchCsrfToken(cookies);
-      console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
-      return fetchWithRetry(
-        "https://www.willys.se/axfood/rest/cart/addProducts",
-        {
-          method: "POST",
-          headers: getApiHeaders(cookies, csrfToken),
-          body: JSON.stringify({
-            products: [
-              {
-                productCodePost: productCode,
-                qty: 0,
-                pickUnit: "pieces",
-                hideDiscountToolTip: false,
-                noReplacementFlag: false,
-              },
-            ],
-          }),
-        },
-      );
-    });
+    const { response } = await withAuthRefresh(
+      sessionId,
+      async (cookies) => {
+        const csrfToken = await fetchCsrfToken(cookies);
+        console.error("Retrieved CSRF token:", truncateForLog(csrfToken));
+        return fetchWithRetry(
+          "https://www.willys.se/axfood/rest/cart/addProducts",
+          {
+            method: "POST",
+            headers: getApiHeaders(cookies, csrfToken),
+            body: JSON.stringify({
+              products: [
+                {
+                  productCodePost: productCode,
+                  qty: 0,
+                  pickUnit: "pieces",
+                  hideDiscountToolTip: false,
+                  noReplacementFlag: false,
+                },
+              ],
+            }),
+          },
+        );
+      },
+      `remove_from_cart productCode=${productCode}`,
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -568,6 +645,14 @@ export async function mcpRemoveFromCart(
 
     return { success: true };
   } catch (error) {
+    if (error instanceof WillysAuthRequiredError) {
+      return {
+        success: false,
+        needsAuth: true,
+        actionDescription: error.actionDescription,
+        message: error.message,
+      };
+    }
     console.error("Error removing from MCP cart:", error);
     return {
       success: false,
@@ -736,7 +821,12 @@ export async function mcpSelectSlot(
   sessionId: string,
   slotCode: string,
   isTmsSlot: boolean = false,
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{
+  success: boolean;
+  message?: string;
+  needsAuth?: boolean;
+  actionDescription?: string;
+}> {
   try {
     const url = isTmsSlot
       ? "https://www.willys.se/axfood/rest/tms/select-slot"
@@ -744,14 +834,18 @@ export async function mcpSelectSlot(
 
     const body = isTmsSlot ? { slotCode, tmsData: {} } : { slotCode };
 
-    const response = await withAuthRefresh(sessionId, async (cookies) => {
-      const csrfToken = await fetchCsrfToken(cookies);
-      return fetchWithRetry(url, {
-        method: "POST",
-        headers: getApiHeaders(cookies, csrfToken),
-        body: JSON.stringify(body),
-      });
-    });
+    const { response } = await withAuthRefresh(
+      sessionId,
+      async (cookies) => {
+        const csrfToken = await fetchCsrfToken(cookies);
+        return fetchWithRetry(url, {
+          method: "POST",
+          headers: getApiHeaders(cookies, csrfToken),
+          body: JSON.stringify(body),
+        });
+      },
+      `select_slot slotCode=${slotCode}`,
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -762,6 +856,14 @@ export async function mcpSelectSlot(
 
     return { success: true };
   } catch (error) {
+    if (error instanceof WillysAuthRequiredError) {
+      return {
+        success: false,
+        needsAuth: true,
+        actionDescription: error.actionDescription,
+        message: error.message,
+      };
+    }
     console.error("Error selecting MCP slot:", error);
     return {
       success: false,
@@ -772,23 +874,33 @@ export async function mcpSelectSlot(
 
 export async function mcpCheckout(
   sessionId: string,
-): Promise<{ success: boolean; message?: string; emptyCart?: boolean }> {
+): Promise<{
+  success: boolean;
+  message?: string;
+  emptyCart?: boolean;
+  needsAuth?: boolean;
+  actionDescription?: string;
+}> {
   try {
-    const response = await withAuthRefresh(sessionId, async (cookies) => {
-      const tracking = generateTrackingHeaders();
-      return fetchWithRetry(
-        "https://www.willys.se/axfood/rest/checkout",
-        {
-          method: "GET",
-          headers: {
-            ...getApiHeaders(cookies),
-            accept: "application/json, text/plain, */*",
-            "x-newrelic-id": "VQcCVVdaDhAHUFFTDwQAVFc=",
-            "x-request-id": tracking.traceparent.split("-")[1],
+    const { response } = await withAuthRefresh(
+      sessionId,
+      async (cookies) => {
+        const tracking = generateTrackingHeaders();
+        return fetchWithRetry(
+          "https://www.willys.se/axfood/rest/checkout",
+          {
+            method: "GET",
+            headers: {
+              ...getApiHeaders(cookies),
+              accept: "application/json, text/plain, */*",
+              "x-newrelic-id": "VQcCVVdaDhAHUFFTDwQAVFc=",
+              "x-request-id": tracking.traceparent.split("-")[1],
+            },
           },
-        },
-      );
-    });
+        );
+      },
+      "checkout",
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -803,6 +915,14 @@ export async function mcpCheckout(
       message: data.emptyCart ? "Cart is empty" : "Checkout successful",
     };
   } catch (error) {
+    if (error instanceof WillysAuthRequiredError) {
+      return {
+        success: false,
+        needsAuth: true,
+        actionDescription: error.actionDescription,
+        message: error.message,
+      };
+    }
     console.error("Error during MCP checkout:", error);
     return {
       success: false,
